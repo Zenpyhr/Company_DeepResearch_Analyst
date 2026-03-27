@@ -1,0 +1,50 @@
+Metadata-Version: 2.4
+Name: company-diligence-agent
+Version: 0.1.0
+Summary: Single-company deep research analyst agent for investment-style diligence.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: beautifulsoup4>=4.12.3
+Requires-Dist: faiss-cpu>=1.8.0
+Requires-Dist: langchain>=0.3.0
+Requires-Dist: langgraph>=0.2.34
+Requires-Dist: openai>=1.51.0
+Requires-Dist: pandas>=2.2.3
+Requires-Dist: pydantic>=2.9.2
+Requires-Dist: pydantic-settings>=2.5.2
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: requests>=2.32.3
+Requires-Dist: streamlit>=1.39.0
+Requires-Dist: yfinance>=0.2.44
+Dynamic: license-file
+
+# Company Diligence Agent
+
+Single-company deep research analyst agent focused on investment-style diligence.
+
+## MVP
+
+- Select one company at a time, starting with NVIDIA (`NVDA`)
+- Refresh filings, company facts, press releases, and market data
+- Store qualitative chunks in a vector index
+- Store quantitative metrics in SQLite
+- Answer questions through a Planner -> Researcher -> Analyst workflow
+
+## Initial Setup
+
+1. Create a virtual environment.
+2. Install the project:
+   ```bash
+   pip install -e .
+   ```
+3. Copy `.env.example` to `.env` and fill in your API key.
+
+## Current Status
+
+Steps 1-2 are scaffolded:
+- project structure
+- configuration loader
+- logging setup
+- local storage path helpers
+

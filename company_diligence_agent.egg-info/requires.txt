@@ -1,0 +1,12 @@
+beautifulsoup4>=4.12.3
+faiss-cpu>=1.8.0
+langchain>=0.3.0
+langgraph>=0.2.34
+openai>=1.51.0
+pandas>=2.2.3
+pydantic>=2.9.2
+pydantic-settings>=2.5.2
+python-dotenv>=1.0.1
+requests>=2.32.3
+streamlit>=1.39.0
+yfinance>=0.2.44
