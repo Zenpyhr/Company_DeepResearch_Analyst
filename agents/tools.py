@@ -47,8 +47,59 @@ from storage.query_service import (
 
 logger = get_logger(__name__)
 
+TEXT_THEME_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "what",
+    "which",
+    "most",
+    "still",
+    "stand",
+    "about",
+    "around",
+    "over",
+    "recent",
+    "reported",
+    "reporting",
+    "support",
+    "supports",
+    "suggest",
+    "suggests",
+    "nvidia",
+    "nvda",
+    "does",
+    "did",
+    "how",
+}
+
+RISK_THEME_PATTERNS: dict[str, list[str]] = {
+    "competition": ["competition", "competitive", "market share"],
+    "supply_chain": ["supply", "capacity", "manufactur", "lead time", "supplier"],
+    "demand_forecasting": ["demand", "forecast", "estimate customer demand", "mismatch"],
+    "regulation_export": ["regulation", "regulatory", "export", "government", "compliance"],
+    "customer_concentration": ["customer concentration", "large customer", "concentration"],
+    "cloud_execution": ["cloud", "service", "deployment", "software", "adoption"],
+}
+
+GROWTH_THEME_PATTERNS: dict[str, list[str]] = {
+    "ai_demand": ["ai", "artificial intelligence", "inference", "training"],
+    "data_center": ["data center", "data-cent", "dgx", "infrastructure"],
+    "software_platform": ["cuda", "software", "sdk", "library", "enterprise"],
+    "partnerships": ["partner", "partnership", "collaboration", "ecosystem"],
+    "product_platform": ["blackwell", "grace", "rubin", "gpu", "platform"],
+}
+
 
 def _json_safe_value(value: Any) -> Any:
+    # Tool outputs are later:
+    # - stored in graph state,
+    # - rendered in Streamlit,
+    # - sometimes serialized into JSON for prompts/artifacts.
+    # This helper normalizes pandas/datetime values early so every downstream stage can
+    # treat tool records as safe, plain Python data instead of worrying about serializer
+    # edge cases.
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, pd.Timestamp):
@@ -97,6 +148,9 @@ class DocumentRetrievalArgs(BaseModel):
 @tool(args_schema=DocumentRetrievalArgs)
 def retrieve_document_context_tool(ticker: str, question: str, top_k: int = 5, source_types: list[str] | None = None) -> dict[str, Any]:
     """Retrieve relevant SEC and press-release chunks for the question."""
+    # This is the qualitative retrieval entrypoint.
+    # It does not interpret the text; it only returns the most relevant chunk rows so the
+    # Collector can package them into the evidence bundle and the EDA stage can analyze them.
     records = _json_safe_records(search_document_chunks(ticker, question, top_k=top_k, source_types=source_types))
     result = ToolResult(
         tool_name="retrieve_document_context_tool",
@@ -122,6 +176,9 @@ def retrieve_financial_metrics_tool(
     limit_per_metric: int = 4,
 ) -> dict[str, Any]:
     """Retrieve structured financial metrics from SQLite."""
+    # This is the main quantitative retrieval entrypoint for accounting-style questions.
+    # The caller chooses metric names and period depth, and the tool returns normalized
+    # rows that are ready for deterministic analysis.
     records = _json_safe_records(
         fetch_financial_metrics(ticker, metric_names=metric_names, periods=periods, limit_per_metric=limit_per_metric)
     )
@@ -153,6 +210,9 @@ def retrieve_market_data_tool(
     limit: int = 40,
 ) -> dict[str, Any]:
     """Retrieve market rows directly or around anchor dates."""
+    # Market data is treated as a second quantitative modality because the time window is
+    # often different from the accounting periods. We support both direct date filters and
+    # anchor-date windows so the workflow can tie price movement back to financial events.
     if anchor_dates:
         records = derive_market_window(ticker, anchor_dates=anchor_dates, days_before=window_days, days_after=window_days)
     else:
@@ -176,6 +236,10 @@ class FinancialTrendArgs(BaseModel):
 @tool(args_schema=FinancialTrendArgs)
 def financial_trend_tool(ticker: str, metric_rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Compute period-over-period changes and trend summaries over metric rows."""
+    # This tool is a good place to study how "EDA" is implemented in practice.
+    # Input: raw metric rows retrieved from SQLite.
+    # Output: structured findings with summaries, supporting records, and numeric metrics.
+    # It also writes an artifact so the analysis can be inspected outside the final answer.
     if not metric_rows:
         return {"findings": [], "artifact_path": None, "summary": "No financial rows available for analysis."}
 
@@ -189,6 +253,8 @@ def financial_trend_tool(ticker: str, metric_rows: list[dict[str, Any]]) -> dict
     findings: list[dict[str, Any]] = []
     artifact_rows: list[dict[str, Any]] = []
     for metric_name, group in df.groupby("metric_name"):
+        # Each metric is analyzed independently so the analyst later receives a set of
+        # small, concrete findings instead of one oversized blob of mixed numeric context.
         group_records = _json_safe_records(group.to_dict(orient="records"))
         latest = group_records[0]
         previous = group_records[1] if len(group_records) > 1 else None
@@ -245,6 +311,9 @@ class MarketReactionArgs(BaseModel):
 @tool(args_schema=MarketReactionArgs)
 def market_reaction_tool(ticker: str, market_rows: list[dict[str, Any]], anchor_dates: list[str] | None = None) -> dict[str, Any]:
     """Analyze market movement and volatility over a retrieved market window."""
+    # This is the market-focused EDA tool. It converts a raw sequence of daily rows into
+    # a compact statement about return and volatility, which is much easier for the final
+    # analyst stage to combine with textual and financial findings.
     if not market_rows:
         return {"findings": [], "artifact_path": None, "summary": "No market rows available for analysis."}
 
@@ -252,7 +321,9 @@ def market_reaction_tool(ticker: str, market_rows: list[dict[str, Any]], anchor_
     if df.empty or "close" not in df:
         return {"findings": [], "artifact_path": None, "summary": "No market rows available for analysis."}
 
-    df["date"] = pd.to_datetime(df.get("date"), errors="coerce")
+    df["date"] = pd.to_datetime(df.get("date"), errors="coerce", utc=True)
+    if getattr(df["date"].dt, "tz", None) is not None:
+        df["date"] = df["date"].dt.tz_convert(None)
     df = df.sort_values("date")
     close_values = df["close"].dropna().astype(float).tolist()
     if len(close_values) < 2:
@@ -263,8 +334,14 @@ def market_reaction_tool(ticker: str, market_rows: list[dict[str, Any]], anchor_
     total_return = safe_pct_change(end_close, start_close)
     daily_returns = [safe_pct_change(curr, prev) or 0.0 for prev, curr in zip(close_values[:-1], close_values[1:])]
     volatility = safe_stddev(daily_returns)
+    anchor_label = None
+    if anchor_dates:
+        anchor_label = sorted({str(anchor)[:10] for anchor in anchor_dates if anchor}, reverse=True)[0]
 
-    summary = f"Over the retrieved window, NVDA moved from {start_close:,.2f} to {end_close:,.2f}"
+    if anchor_label:
+        summary = f"Around the reporting anchor on {anchor_label}, NVDA moved from {start_close:,.2f} to {end_close:,.2f}"
+    else:
+        summary = f"Over the retrieved window, NVDA moved from {start_close:,.2f} to {end_close:,.2f}"
     if total_return is not None:
         summary += f" ({total_return:+.1f}% total return)"
     if volatility is not None:
@@ -301,13 +378,24 @@ class TextThemeArgs(BaseModel):
 @tool(args_schema=TextThemeArgs)
 def text_theme_tool(ticker: str, chunk_rows: list[dict[str, Any]], question: str) -> dict[str, Any]:
     """Perform deterministic text analysis over retrieved chunk rows."""
+    # This is the qualitative EDA tool. Instead of asking an LLM to "summarize the text,"
+    # we compute simple deterministic signals first: repeated sections and question-linked
+    # terms. That makes the qualitative path more auditable and assignment-friendly.
     if not chunk_rows:
         return {"findings": [], "artifact_path": None, "summary": "No qualitative records available for analysis."}
 
-    question_terms = [token for token in question.lower().split() if len(token) > 3]
+    question_terms = [
+        token
+        for token in pd.unique(pd.Series(question.lower().replace("?", " ").replace(",", " ").split())).tolist()
+        if isinstance(token, str) and len(token) > 3 and token not in TEXT_THEME_STOPWORDS
+    ]
     section_counter: Counter[str] = Counter()
     keyword_counter: Counter[str] = Counter()
+    theme_counter: Counter[str] = Counter()
     supporting_records: list[dict[str, Any]] = []
+    lowered_question = question.lower()
+    use_risk_themes = "risk" in lowered_question
+    use_growth_themes = any(term in lowered_question for term in ["growth", "ai", "demand", "press", "release"])
 
     for row in chunk_rows:
         metadata = row.get("metadata_json", {}) or {}
@@ -317,13 +405,24 @@ def text_theme_tool(ticker: str, chunk_rows: list[dict[str, Any]], question: str
         for term in question_terms:
             if term in text:
                 keyword_counter[term] += text.count(term)
+        if use_risk_themes:
+            for theme_name, patterns in RISK_THEME_PATTERNS.items():
+                if any(pattern in text for pattern in patterns):
+                    theme_counter[theme_name] += 1
+        if use_growth_themes:
+            for theme_name, patterns in GROWTH_THEME_PATTERNS.items():
+                if any(pattern in text for pattern in patterns):
+                    theme_counter[theme_name] += 1
         if len(supporting_records) < 5:
             supporting_records.append(_json_safe_value(row))
 
     dominant_section, dominant_count = section_counter.most_common(1)[0]
     top_keywords = keyword_counter.most_common(5)
+    top_themes = theme_counter.most_common(5)
     summary = f"Retrieved text evidence concentrates most heavily in {dominant_section} ({dominant_count} chunks)."
-    if top_keywords:
+    if top_themes:
+        summary += " Most visible themes: " + ", ".join(f"{theme.replace('_', ' ')} ({count})" for theme, count in top_themes) + "."
+    elif top_keywords:
         summary += " Most repeated question-linked terms: " + ", ".join(f"{term} ({count})" for term, count in top_keywords) + "."
 
     chart_rows = [{"label": label, "count": count} for label, count in section_counter.most_common()]
@@ -336,6 +435,7 @@ def text_theme_tool(ticker: str, chunk_rows: list[dict[str, Any]], question: str
             "dominant_section": dominant_section,
             "dominant_section_count": dominant_count,
             "top_keywords": top_keywords,
+            "top_themes": top_themes,
         },
     }
     return {"findings": [finding], "artifact_path": artifact_path, "summary": "Computed text-theme analysis."}
@@ -370,6 +470,78 @@ def chart_tool(ticker: str, title: str, rows: list[dict[str, Any]], x_field: str
     return {"chart_spec": spec, "artifact_path": artifact_path}
 
 
+def _rank_findings_for_question(question: str, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    lowered_question = question.lower()
+    wants_risk = "risk" in lowered_question
+    wants_market = any(term in lowered_question for term in ["stock", "market", "price", "reaction"])
+    wants_growth = any(term in lowered_question for term in ["revenue", "growth", "financial", "income", "margin", "profit"])
+
+    metric_priority = {
+        "revenue": 0,
+        "gross_profit": 1,
+        "net_income": 2,
+        "cash_and_cash_equivalents": 3,
+        "research_and_development": 4,
+        "eps_diluted": 5,
+    }
+
+    def score(finding: dict[str, Any]) -> tuple[int, int, str]:
+        finding_type = str(finding.get("finding_type") or "")
+        metrics = finding.get("metrics", {}) or {}
+        metric_name = str(metrics.get("metric_name") or "")
+
+        if wants_market and not wants_growth and not wants_risk:
+            priority_map = {
+                "market_reaction": 0,
+                "financial_trend": 1,
+                "text_theme": 2,
+            }
+            return (priority_map.get(finding_type, 9), metric_priority.get(metric_name, 9), metric_name)
+
+        if wants_risk and not wants_growth and not wants_market:
+            priority_map = {
+                "text_theme": 0,
+                "financial_trend": 1,
+                "market_reaction": 2,
+            }
+            return (priority_map.get(finding_type, 9), metric_priority.get(metric_name, 9), metric_name)
+
+        if wants_growth and wants_risk:
+            if finding_type == "financial_trend":
+                growth_priority = {
+                    "revenue": 0,
+                    "gross_profit": 2,
+                    "net_income": 3,
+                    "cash_and_cash_equivalents": 4,
+                    "research_and_development": 5,
+                    "eps_diluted": 6,
+                }
+                return (0 if metric_name == "revenue" else 2, growth_priority.get(metric_name, 9), metric_name)
+            if finding_type == "text_theme":
+                return (1, 0, metric_name)
+            if finding_type == "market_reaction":
+                return (4, 0, metric_name)
+            return (9, 9, metric_name)
+
+        if wants_growth:
+            if finding_type == "financial_trend":
+                return (0, metric_priority.get(metric_name, 9), metric_name)
+            if finding_type == "text_theme":
+                return (1, 0, metric_name)
+            if finding_type == "market_reaction":
+                return (2, 0, metric_name)
+            return (9, 9, metric_name)
+
+        priority_map = {
+            "financial_trend": 0,
+            "text_theme": 1,
+            "market_reaction": 2,
+        }
+        return (priority_map.get(finding_type, 9), metric_priority.get(metric_name, 9), metric_name)
+
+    return sorted(findings, key=score)
+
+
 def final_answer_builder(
     *,
     ticker: str,
@@ -378,6 +550,12 @@ def final_answer_builder(
     evidence_bundle: dict[str, Any],
     llm_summary: str | None = None,
 ) -> tuple[FinalAnswer, str]:
+    # This helper is the last step that turns structured evidence into a deliverable.
+    # It intentionally works from findings/evidence rather than the raw question alone,
+    # which keeps the final answer grounded in earlier stages of the pipeline.
+    ranked_findings = _rank_findings_for_question(question, list(findings))
+    selected_findings = ranked_findings[:3]
+
     sources: list[str] = []
     key_points: list[str] = []
     support_snippets: list[str] = []
@@ -393,7 +571,7 @@ def final_answer_builder(
         if source_url and source_url not in sources:
             sources.append(str(source_url))
 
-    for finding in findings[:5]:
+    for finding in selected_findings:
         summary = finding.get("summary")
         if summary:
             key_points.append(str(summary))
@@ -412,7 +590,7 @@ def final_answer_builder(
         company_ticker=ticker,
         question=question,
         answer=answer_text,
-        key_points=key_points[:5],
+        key_points=key_points[:3],
         sources=sources[:8],
         confidence_note="This answer is grounded in retrieved evidence and deterministic EDA over the local NVDA dataset.",
     )

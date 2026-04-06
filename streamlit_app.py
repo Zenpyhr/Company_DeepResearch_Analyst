@@ -17,6 +17,10 @@ logger = get_logger(__name__)
 
 
 def _render_collect_section(plan: ResearchPlan, evidence_bundle: EvidenceBundle) -> None:
+    # This tab answers "what did the system collect before it started reasoning?"
+    # Keeping the collection stage visible is important for the assignment and for debugging:
+    # if the final answer looks weak, this section tells us whether the problem started with
+    # missing evidence rather than bad analysis or synthesis.
     st.subheader("Collect")
     st.write("The Collector agent decides which evidence to retrieve before any conclusion is written.")
     st.markdown("**Research goals**")
@@ -60,6 +64,9 @@ def _render_chart(chart_spec: dict[str, Any] | None) -> None:
 
 
 def _render_explore_section(analysis_bundle: AnalysisBundle, chart_spec: dict[str, Any] | None, chart_artifact_path: str | None) -> None:
+    # This tab is the EDA checkpoint. It shows tool-produced findings before the final memo,
+    # so we can verify the system actually analyzed the retrieved data instead of jumping
+    # straight from raw evidence to a conclusion.
     st.subheader("Explore / Analyze")
     st.write("The EDA agent uses tool calls over the retrieved data before the analyst hypothesis is formed.")
     for finding in analysis_bundle.findings:
@@ -82,6 +89,9 @@ def _render_explore_section(analysis_bundle: AnalysisBundle, chart_spec: dict[st
 
 
 def _render_hypothesis_section(final_answer: FinalAnswer, memo_artifact_path: str | None) -> None:
+    # This is the final analyst deliverable. By the time we render this tab, the workflow
+    # has already completed collection and EDA, so this section should read like a synthesis
+    # of earlier evidence rather than a brand-new source of facts.
     st.subheader("Hypothesis")
     st.write("The Analyst agent synthesizes the evidence and EDA findings into a grounded answer.")
     st.markdown(final_answer.answer)
@@ -100,6 +110,13 @@ def _render_hypothesis_section(final_answer: FinalAnswer, memo_artifact_path: st
 
 
 def main() -> None:
+    # `main()` is the easiest starting point for reading the app because it wires together
+    # the full top-level user flow:
+    # 1. ensure storage exists,
+    # 2. render the Streamlit controls,
+    # 3. run the workflow when the user clicks the button,
+    # 4. unpack the structured stage outputs,
+    # 5. render Collect -> Explore/Analyze -> Hypothesis tabs.
     bootstrap_storage()
     settings = get_settings()
     st.set_page_config(page_title="NVDA Analyst Agent", layout="wide")
@@ -128,6 +145,9 @@ def main() -> None:
     )
 
     if st.button("Run Analyst Workflow", type="primary", use_container_width=True):
+        # This is the single frontend call that kicks off the agent graph.
+        # Everything interesting downstream happens inside `run_analyst_workflow()`:
+        # classification, retrieval, EDA, synthesis, artifact writing, and optional retry.
         with st.spinner("Running Collector -> EDA -> Analyst workflow..."):
             st.session_state.workflow_result = run_analyst_workflow(question, company_ticker=ticker)
 
@@ -136,6 +156,9 @@ def main() -> None:
         st.info("Refresh the data if needed, then ask a question to run the workflow.")
         return
 
+    # The workflow returns plain dictionaries because that is the easiest shape to persist
+    # through Streamlit session state and LangGraph state. We immediately convert them back
+    # into typed Pydantic models here so the UI layer can rely on a stable contract.
     plan = ResearchPlan.model_validate(result["research_plan"])
     evidence_bundle = EvidenceBundle.model_validate(result["evidence_bundle"])
     analysis_bundle = AnalysisBundle.model_validate(result["analysis_bundle"])

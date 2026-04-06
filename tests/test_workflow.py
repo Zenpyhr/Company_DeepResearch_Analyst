@@ -146,6 +146,60 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(len(rows), 1)
         self.assertIn("risk", rows[0]["chunk_text"].lower())
 
+    def test_financial_metric_fetch_preserves_multiple_periods(self) -> None:
+        from storage.query_service import fetch_financial_metrics
+
+        rows = fetch_financial_metrics("NVDA", metric_names=["revenue"], limit_per_metric=4)
+        periods = [row["fiscal_period"] for row in rows]
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertIn("2026-Q3", periods)
+        self.assertIn("2026-Q2", periods)
+
+    def test_mixed_document_retrieval_preserves_press_release_evidence(self) -> None:
+        from storage.query_service import search_document_chunks
+
+        rows = search_document_chunks(
+            "NVDA",
+            "What do recent filings and press releases suggest about growth versus risk for NVIDIA?",
+            top_k=4,
+        )
+        source_types = {row["source_type"] for row in rows}
+        self.assertIn("sec_filing", source_types)
+        self.assertIn("press_release", source_types)
+
+    def test_question_classifier_stays_focused_for_revenue_and_market_questions(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+
+        revenue_category, revenue_type = graph_workflow._classify_question(  # type: ignore[attr-defined]
+            "How has NVIDIA revenue changed over recent reported periods?"
+        )
+        market_category, market_type = graph_workflow._classify_question(  # type: ignore[attr-defined]
+            "How did NVDA stock react around recent reporting periods?"
+        )
+
+        self.assertEqual(("financial_trend", "quantitative"), (revenue_category, revenue_type))
+        self.assertEqual(("market_reaction", "quantitative"), (market_category, market_type))
+
+    def test_anchor_dates_prefer_filed_dates(self) -> None:
+        from storage.query_service import fetch_financial_metrics, infer_anchor_dates_from_metrics
+
+        metric_rows = fetch_financial_metrics("NVDA", metric_names=["revenue"], limit_per_metric=4)
+        anchors = infer_anchor_dates_from_metrics(metric_rows, max_dates=2)
+        self.assertTrue(anchors)
+        self.assertEqual("2026-02-25", anchors[0])
+
+    def test_text_theme_tool_surfaces_concrete_risk_themes(self) -> None:
+        from storage.query_service import search_document_chunks
+        from agents.tools import text_theme_tool
+
+        rows = search_document_chunks("NVDA", "What risks does NVIDIA emphasize most in recent filings?", top_k=4)
+        result = text_theme_tool.invoke(
+            {"ticker": "NVDA", "chunk_rows": rows, "question": "What risks does NVIDIA emphasize most in recent filings?"}
+        )
+        self.assertTrue(result["findings"])
+        top_themes = result["findings"][0]["metrics"].get("top_themes", [])
+        self.assertTrue(top_themes)
+
     def test_financial_trend_tool_creates_findings(self) -> None:
         from storage.query_service import fetch_financial_metrics
         from agents.tools import financial_trend_tool

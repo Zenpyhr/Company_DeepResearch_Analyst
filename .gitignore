@@ -7,3 +7,4 @@ data/app.db
 data/companies/*/raw/
 data/companies/*/vector/
 data/companies/*/processed/analysis/
+data/companies/*/processed/evaluations/
