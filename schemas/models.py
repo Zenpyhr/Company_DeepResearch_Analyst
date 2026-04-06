@@ -98,7 +98,7 @@ class Event(BaseSchema):
 
 
 class ResearchPlan(BaseSchema):
-    # This will be produced by the Planner Agent to guide the rest of the workflow.
+    # This is produced before collection to guide the workflow.
     company_ticker: str
     question: str
     question_type: QuestionType
@@ -127,7 +127,7 @@ class ToolResult(BaseSchema):
 
 
 class EvidenceBundle(BaseSchema):
-    # A shared evidence package passed from Researcher to EDA/Analyst.
+    # A shared evidence package passed from the Collector to EDA/Analyst.
     company_ticker: str
     question: str
     qualitative_records: list[dict[str, Any]] = Field(default_factory=list)

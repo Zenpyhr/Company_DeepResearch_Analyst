@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 
 def _render_collect_section(plan: ResearchPlan, evidence_bundle: EvidenceBundle) -> None:
     st.subheader("Collect")
-    st.write("The Researcher agent decides which evidence to retrieve before any conclusion is written.")
+    st.write("The Collector agent decides which evidence to retrieve before any conclusion is written.")
     st.markdown("**Research goals**")
     for goal in plan.goals:
         st.write(f"- {goal}")
@@ -128,7 +128,7 @@ def main() -> None:
     )
 
     if st.button("Run Analyst Workflow", type="primary", use_container_width=True):
-        with st.spinner("Running Researcher -> EDA -> Analyst workflow..."):
+        with st.spinner("Running Collector -> EDA -> Analyst workflow..."):
             st.session_state.workflow_result = run_analyst_workflow(question, company_ticker=ticker)
 
     result = st.session_state.workflow_result

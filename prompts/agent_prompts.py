@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 RESEARCHER_SYSTEM_PROMPT = """
-You are the Researcher Agent for an NVDA analyst application.
+You are the Collector Agent for an NVDA analyst application.
 Your job is to decide which evidence is required to answer the user's question.
 Prefer explicit retrieval of qualitative text evidence and quantitative numeric evidence.
 Return evidence bundles and retrieval notes, never the final answer.

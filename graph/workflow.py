@@ -147,7 +147,7 @@ def _merge_records(existing: list[dict[str, Any]], incoming: list[dict[str, Any]
     return merged
 
 
-def _researcher_node(state: AgentState) -> AgentState:
+def _collector_node(state: AgentState) -> AgentState:
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
     plan = _build_research_plan(question, ticker)
@@ -406,7 +406,7 @@ def _eda_node(state: AgentState) -> AgentState:
 def _route_after_eda(state: AgentState) -> str:
     analysis_bundle = AnalysisBundle.model_validate(state["analysis_bundle"])
     if analysis_bundle.requires_additional_research and state.get("loop_count", 0) < 1:
-        return "researcher"
+        return "collector"
     return "analyst"
 
 
@@ -446,10 +446,10 @@ def _analyst_node(state: AgentState) -> AgentState:
 class _FallbackWorkflow:
     def invoke(self, initial_state: AgentState) -> AgentState:
         state = dict(initial_state)
-        state.update(_researcher_node(state))
+        state.update(_collector_node(state))
         state.update(_eda_node(state))
-        if _route_after_eda(state) == "researcher":
-            state.update(_researcher_node(state))
+        if _route_after_eda(state) == "collector":
+            state.update(_collector_node(state))
             state.update(_eda_node(state))
         state.update(_analyst_node(state))
         return state
@@ -461,12 +461,12 @@ def build_workflow():
         return _FallbackWorkflow()
 
     graph = StateGraph(AgentState)
-    graph.add_node("researcher", _researcher_node)
+    graph.add_node("collector", _collector_node)
     graph.add_node("eda", _eda_node)
     graph.add_node("analyst", _analyst_node)
-    graph.add_edge(START, "researcher")
-    graph.add_edge("researcher", "eda")
-    graph.add_conditional_edges("eda", _route_after_eda, {"researcher": "researcher", "analyst": "analyst"})
+    graph.add_edge(START, "collector")
+    graph.add_edge("collector", "eda")
+    graph.add_conditional_edges("eda", _route_after_eda, {"collector": "collector", "analyst": "analyst"})
     graph.add_edge("analyst", END)
     return graph.compile()
 

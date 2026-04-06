@@ -10,7 +10,7 @@ Single-company deep research analyst agent for `NVDA` with explicit `Collect -> 
   - Yahoo Finance market data
   - NVIDIA press releases
 - Runs a LangGraph multi-agent workflow:
-  - `Researcher Agent`
+  - `Collector Agent`
   - `EDA Agent`
   - `Analyst Agent`
 - Uses two retrieval methods:
@@ -25,27 +25,40 @@ flowchart TD
     U[User]
     UI[Streamlit Frontend]
     O[LangGraph Orchestrator]
-    R[Researcher Agent]
+    C[Collector Agent]
     E[EDA Agent]
     A[Analyst Agent]
     OUT[Grounded Answer<br/>Citations<br/>Chart / Memo]
 
-    U --> UI --> O --> R --> E --> A --> OUT --> UI
-    E -. if evidence is weak .-> R
+    Q[User Question]
+    EB[Evidence Bundle<br/>qualitative records + quantitative records]
+    AF[Analysis Findings<br/>trends + themes + market reaction]
 
-    R --> Q[Retrieval Layer]
-    Q --> QR[Qualitative Retrieval<br/>SEC chunks + press-release chunks]
-    Q --> QN[Quantitative Retrieval<br/>financial metrics + market data]
+    U --> UI
+    UI --> Q
+    Q --> O
+    O --> C
+    C --> EB
+    EB --> E
+    E --> AF
+    AF --> A
+    A --> OUT
+    OUT --> UI
+    E -. if evidence is weak, ask for more evidence .-> C
 
-    S[Runtime Data Sources<br/>SEC Filings<br/>SEC CompanyFacts<br/>Yahoo Finance<br/>NVIDIA Press Releases] --> Q
-    D[(Data Storage<br/>SQLite local / Cloud SQL hosted)] --> Q
+    C --> RL[Retrieval Layer]
+    RL --> QR[Qualitative Retrieval<br/>SEC chunks + press-release chunks]
+    RL --> QN[Quantitative Retrieval<br/>financial metrics + market data]
+
+    S[Runtime Data Sources<br/>SEC Filings<br/>SEC CompanyFacts<br/>Yahoo Finance<br/>NVIDIA Press Releases] --> RL
+    D[(Data Storage<br/>SQLite local / Cloud SQL hosted)] --> RL
     F[(Artifacts / Raw Files<br/>local disk / Cloud Storage)] --> OUT
-    L[LLM Backend<br/>OpenAI local / Vertex AI production] --> R
+    L[LLM Backend<br/>OpenAI local / Vertex AI production] --> C
     L --> E
     L --> A
 ```
 
-At a high level, the `Researcher Agent` gathers evidence through the retrieval layer, the `EDA Agent` analyzes it with tool calls, and the `Analyst Agent` turns that evidence plus analysis into the final grounded answer shown in the frontend.
+At a high level, the `Collector Agent` gathers evidence through the retrieval layer, packages it into an `Evidence Bundle`, the `EDA Agent` turns that into `Analysis Findings`, and the `Analyst Agent` uses both as input for the final grounded answer shown in the frontend.
 
 ## Run Locally
 
@@ -78,7 +91,7 @@ The graph above is the system-level view. The stage-by-stage workflow below maps
 
 ### Collect
 
-The `Researcher Agent` gathers the evidence needed for the question before any conclusion is written.
+The `Collector Agent` gathers the evidence needed for the question before any conclusion is written.
 
 - Refresh + collection:
   - [pipelines/refresh_company.py](./pipelines/refresh_company.py) `refresh_company_data`
@@ -133,7 +146,7 @@ The `Analyst Agent` synthesizes the evidence and EDA findings into a grounded an
 - `Non-trivial dataset`
   - runtime SEC, CompanyFacts, market data, and press-release collection in [pipelines/](./pipelines)
 - `Multi-agent pattern`
-  - `Researcher -> EDA -> Analyst` in [graph/workflow.py](./graph/workflow.py)
+  - `Collector -> EDA -> Analyst` in [graph/workflow.py](./graph/workflow.py)
 - `Deployed`
   - Docker + Cloud Build + Cloud Run scaffolding:
     - [Dockerfile](./Dockerfile)
