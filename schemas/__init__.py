@@ -1,8 +1,11 @@
 ﻿"""Shared Pydantic schemas live here."""
 
 from schemas.models import (
+    AnalysisBundle,
+    AnalysisFinding,
     Chunk,
     Company,
+    EvidenceBundle,
     Event,
     FinalAnswer,
     FinancialMetric,
@@ -14,8 +17,11 @@ from schemas.models import (
 )
 
 __all__ = [
+    "AnalysisBundle",
+    "AnalysisFinding",
     "Chunk",
     "Company",
+    "EvidenceBundle",
     "Event",
     "FinalAnswer",
     "FinancialMetric",

@@ -29,12 +29,17 @@ def vector_data_dir(ticker: str) -> Path:
     return company_root(ticker) / "vector"
 
 
+def artifact_data_dir(ticker: str) -> Path:
+    return processed_data_dir(ticker) / get_settings().artifact_dir_name
+
+
 def company_paths(ticker: str) -> dict[str, Path]:
     return {
         "root": company_root(ticker),
         "raw": raw_data_dir(ticker),
         "processed": processed_data_dir(ticker),
         "vector": vector_data_dir(ticker),
+        "artifacts": artifact_data_dir(ticker),
     }
 
 
@@ -43,4 +48,3 @@ def ensure_company_dirs(ticker: str) -> dict[str, Path]:
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
     return paths
-

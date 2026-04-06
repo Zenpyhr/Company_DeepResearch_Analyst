@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # That makes downstream filtering and tool responses much easier to reason about.
 SourceType = Literal["sec_filing", "press_release", "companyfacts", "market_data", "derived"]
 QuestionType = Literal["qualitative", "quantitative", "mixed"]
+QuestionCategory = Literal["financial_trend", "market_reaction", "risk_narrative", "mixed"]
 
 
 class BaseSchema(BaseModel):
@@ -101,6 +102,7 @@ class ResearchPlan(BaseSchema):
     company_ticker: str
     question: str
     question_type: QuestionType
+    question_category: QuestionCategory | None = None
     goals: list[str] = Field(default_factory=list)
     tools_to_call: list[str] = Field(default_factory=list)
     notes: str | None = None
@@ -122,6 +124,35 @@ class ToolResult(BaseSchema):
     summary: str
     records: list[dict[str, Any]] = Field(default_factory=list)
     error_message: str | None = None
+
+
+class EvidenceBundle(BaseSchema):
+    # A shared evidence package passed from Researcher to EDA/Analyst.
+    company_ticker: str
+    question: str
+    qualitative_records: list[dict[str, Any]] = Field(default_factory=list)
+    quantitative_records: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_notes: list[str] = Field(default_factory=list)
+    tool_results: list[ToolResult] = Field(default_factory=list)
+
+
+class AnalysisFinding(BaseSchema):
+    # A concrete, evidence-backed EDA result.
+    finding_type: str
+    summary: str
+    supporting_records: list[dict[str, Any]] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    chart_artifact_path: str | None = None
+
+
+class AnalysisBundle(BaseSchema):
+    # The output of the EDA stage before the final analyst synthesis.
+    company_ticker: str
+    question: str
+    findings: list[AnalysisFinding] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    requires_additional_research: bool = False
+    missing_modalities: list[str] = Field(default_factory=list)
 
 
 class FinalAnswer(BaseSchema):

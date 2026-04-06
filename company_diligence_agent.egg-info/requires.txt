@@ -1,5 +1,8 @@
 beautifulsoup4>=4.12.3
 faiss-cpu>=1.8.0
+google-cloud-aiplatform>=1.74.0
+google-cloud-secret-manager>=2.21.0
+google-cloud-storage>=2.18.2
 langchain>=0.3.0
 langgraph>=0.2.34
 openai>=1.51.0

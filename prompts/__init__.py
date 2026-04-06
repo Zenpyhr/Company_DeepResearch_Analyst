@@ -1,2 +1,5 @@
 """Prompt templates live here."""
 
+from prompts.agent_prompts import ANALYST_SYSTEM_PROMPT, EDA_SYSTEM_PROMPT, RESEARCHER_SYSTEM_PROMPT
+
+__all__ = ["ANALYST_SYSTEM_PROMPT", "EDA_SYSTEM_PROMPT", "RESEARCHER_SYSTEM_PROMPT"]
