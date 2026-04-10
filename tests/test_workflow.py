@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import importlib
 import os
-import tempfile
+import shutil
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import Mock, patch
+from uuid import uuid4
 
 
 class WorkflowSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.temp_dir = tempfile.TemporaryDirectory()
-        data_dir = Path(cls.temp_dir.name) / "data"
+        workspace_tmp = Path.cwd() / "data" / "test_tmp"
+        workspace_tmp.mkdir(parents=True, exist_ok=True)
+        cls.temp_dir = workspace_tmp / f"workflow_{uuid4().hex}"
+        cls.temp_dir.mkdir(parents=True, exist_ok=True)
+        data_dir = cls.temp_dir / "data"
         os.environ["DATA_DIR"] = str(data_dir)
         os.environ["SQLITE_DB_PATH"] = str(data_dir / "app.db")
         os.environ["DEFAULT_TICKER"] = "NVDA"
@@ -137,7 +142,7 @@ class WorkflowSmokeTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls.temp_dir.cleanup()
+        shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     def test_document_retrieval_returns_relevant_chunk(self) -> None:
         from storage.query_service import search_document_chunks
@@ -180,6 +185,35 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertEqual(("financial_trend", "quantitative"), (revenue_category, revenue_type))
         self.assertEqual(("market_reaction", "quantitative"), (market_category, market_type))
 
+    def test_planner_falls_back_to_heuristic_when_llm_plan_is_unavailable(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+
+        with patch.object(graph_workflow, "_llm_orchestration_plan", return_value=None):
+            result = graph_workflow._planner_node({"question": "How has NVIDIA revenue changed?", "company_ticker": "NVDA"})  # type: ignore[attr-defined]
+
+        self.assertEqual("heuristic_fallback", result["routing_source"])
+        self.assertIn("orchestration_plan", result)
+        self.assertTrue(result["selected_tools"])
+
+    def test_planner_accepts_llm_orchestration_plan(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        fallback = graph_workflow._heuristic_orchestration_plan("What risks does NVIDIA emphasize most in recent filings?", "NVDA")  # type: ignore[attr-defined]
+        llm_plan = fallback.model_copy(
+            update={
+                "planning_source": "llm",
+                "eda_plan": fallback.eda_plan.model_copy(update={"selected_tools": ["text_theme_tool"]}),
+            }
+        )
+
+        with patch.object(graph_workflow, "_llm_orchestration_plan", return_value=llm_plan):
+            result = graph_workflow._planner_node(
+                {"question": "What risks does NVIDIA emphasize most in recent filings?", "company_ticker": "NVDA"}
+            )  # type: ignore[attr-defined]
+
+        self.assertEqual("llm", result["routing_source"])
+        self.assertEqual("llm", result["orchestration_plan"]["planning_source"])
+        self.assertIn("text_theme_tool", result["selected_tools"])
+
     def test_anchor_dates_prefer_filed_dates(self) -> None:
         from storage.query_service import fetch_financial_metrics, infer_anchor_dates_from_metrics
 
@@ -200,6 +234,34 @@ class WorkflowSmokeTests(unittest.TestCase):
         top_themes = result["findings"][0]["metrics"].get("top_themes", [])
         self.assertTrue(top_themes)
 
+    def test_text_theme_tool_returns_source_specific_theme_breakdown(self) -> None:
+        from agents.tools import text_theme_tool
+
+        rows = [
+            {
+                "source_type": "sec_filing",
+                "chunk_text": "Supply constraints and competition remain important risk factors for data center growth.",
+                "metadata_json": {"section_label": "item_1a_risk_factors"},
+            },
+            {
+                "source_type": "press_release",
+                "chunk_text": "NVIDIA highlighted AI demand and data center partnerships in the latest announcement.",
+                "metadata_json": {"section_label": "press_release"},
+            },
+        ]
+
+        result = text_theme_tool.invoke(
+            {
+                "ticker": "NVDA",
+                "chunk_rows": rows,
+                "question": "What do recent filings and press releases suggest about growth versus risk for NVIDIA?",
+            }
+        )
+
+        metrics = result["findings"][0]["metrics"]
+        self.assertTrue(metrics.get("filing_top_themes"))
+        self.assertTrue(metrics.get("press_release_top_themes"))
+
     def test_financial_trend_tool_creates_findings(self) -> None:
         from storage.query_service import fetch_financial_metrics
         from agents.tools import financial_trend_tool
@@ -215,10 +277,81 @@ class WorkflowSmokeTests(unittest.TestCase):
             "Do NVIDIA's recent financials support the AI growth narrative, and what risks still stand out?",
             company_ticker="NVDA",
         )
+        self.assertIn("orchestration_plan", result)
         self.assertIn("analysis_bundle", result)
         self.assertIn("final_answer", result)
+        self.assertIn("routing_source", result)
+        self.assertIn("selected_tools", result)
+        self.assertIn("requested_sources", result)
+        self.assertIn("selected_sources", result)
         self.assertTrue(result["analysis_bundle"]["findings"])
         self.assertTrue(result["final_answer"]["answer"])
+
+    def test_quantitative_question_does_not_report_retrieved_qualitative_sources(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        result = graph_workflow.run_analyst_workflow(
+            "How has NVIDIA revenue changed over recent reported periods?",
+            company_ticker="NVDA",
+        )
+        self.assertEqual("quantitative", result["research_plan"]["question_type"])
+        self.assertEqual([], result["selected_sources"])
+
+    def test_mixed_growth_risk_question_does_not_request_market_data_by_default(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        plan = graph_workflow._heuristic_orchestration_plan(
+            "Do NVIDIA's recent financials support the AI growth narrative, and what risks still stand out?",
+            "NVDA",
+        )
+        self.assertFalse(plan.retrieval_plan.needs_market_data)
+        self.assertNotIn("market_reaction_tool", plan.eda_plan.selected_tools)
+        self.assertIn("financial_trend", plan.sub_intents)
+        self.assertIn("risk_narrative", plan.sub_intents)
+
+    def test_broad_question_triggers_clarification_suggestion(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        result = graph_workflow._planner_node({"question": "Tell me about NVIDIA", "company_ticker": "NVDA"})  # type: ignore[attr-defined]
+        self.assertTrue(result["clarification_needed"])
+        self.assertIn("financial performance", result["clarification_question"])
+
+    def test_mixed_answer_includes_source_aware_narrative_point(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        result = graph_workflow.run_analyst_workflow(
+            "What do recent filings and press releases suggest about growth versus risk for NVIDIA?",
+            company_ticker="NVDA",
+        )
+        key_points = result["final_answer"]["key_points"]
+        self.assertTrue(any("Filings" in point or "press releases" in point for point in key_points))
+        self.assertTrue(any("supply chain" in point.lower() or "ai demand" in point.lower() for point in key_points))
+
+    def test_resolve_company_can_use_sec_lookup_for_new_ticker(self) -> None:
+        from pipelines import company_registry
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "0": {"ticker": "MSFT", "cik_str": 789019, "title": "MICROSOFT CORP"}
+        }
+        mock_response.raise_for_status.return_value = None
+
+        company_registry._sec_company_lookup.cache_clear()
+        with patch("pipelines.company_registry.requests.get", return_value=mock_response):
+            company = company_registry.resolve_company("MSFT")
+
+        self.assertEqual("MSFT", company.ticker)
+        self.assertEqual("MICROSOFT CORP", company.company_name)
+        self.assertEqual("0000789019", company.cik)
+
+    def test_ui_ticker_helpers_support_new_ticker_entry(self) -> None:
+        from app.config import get_settings
+        from app.paths import ensure_company_dirs
+        from streamlit_app import _available_tickers, _resolve_sidebar_ticker
+
+        ensure_company_dirs("MSFT")
+        get_settings.cache_clear()
+
+        tickers = _available_tickers("NVDA")
+        self.assertIn("MSFT", tickers)
+        self.assertEqual("MSFT", _resolve_sidebar_ticker("NVDA", "msft"))
+        self.assertEqual("NVDA", _resolve_sidebar_ticker("NVDA", ""))
 
 
 if __name__ == "__main__":

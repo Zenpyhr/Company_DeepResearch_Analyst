@@ -11,6 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field
 SourceType = Literal["sec_filing", "press_release", "companyfacts", "market_data", "derived"]
 QuestionType = Literal["qualitative", "quantitative", "mixed"]
 QuestionCategory = Literal["financial_trend", "market_reaction", "risk_narrative", "mixed"]
+QuestionSubIntent = Literal["financial_trend", "market_reaction", "risk_narrative"]
+PlanningSource = Literal["llm", "heuristic"]
+RoutingSource = Literal["llm", "heuristic_fallback"]
 
 
 class BaseSchema(BaseModel):
@@ -103,9 +106,53 @@ class ResearchPlan(BaseSchema):
     question: str
     question_type: QuestionType
     question_category: QuestionCategory | None = None
+    sub_intents: list[QuestionSubIntent] = Field(default_factory=list)
     goals: list[str] = Field(default_factory=list)
     tools_to_call: list[str] = Field(default_factory=list)
     notes: str | None = None
+
+
+class RetrievalPlan(BaseSchema):
+    # Structured retrieval instructions produced by the orchestrator.
+    needs_qualitative: bool = False
+    needs_quantitative: bool = False
+    source_types: list[Literal["sec_filing", "press_release"]] = Field(default_factory=list)
+    metric_names: list[str] = Field(default_factory=list)
+    limit_per_metric: int = Field(default=4, ge=1, le=12)
+    needs_market_data: bool = False
+    anchor_date_count: int = Field(default=1, ge=1, le=4)
+    market_window_days: int = Field(default=2, ge=1, le=30)
+
+
+class EDAPlan(BaseSchema):
+    # Structured EDA-tool selection produced by the orchestrator.
+    selected_tools: list[str] = Field(default_factory=list)
+    chart_metric: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class RetryDecision(BaseSchema):
+    # Retry decision after the first EDA pass.
+    retry_requested: bool = False
+    missing_modalities: list[str] = Field(default_factory=list)
+    missing_sources: list[str] = Field(default_factory=list)
+    missing_metrics: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
+class OrchestrationPlan(BaseSchema):
+    # High-level decision object that drives Collector and EDA behavior.
+    company_ticker: str
+    question: str
+    question_type: QuestionType
+    question_category: QuestionCategory
+    sub_intents: list[QuestionSubIntent] = Field(default_factory=list)
+    retrieval_plan: RetrievalPlan
+    eda_plan: EDAPlan
+    retry_policy: dict[str, Any] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+    confidence_notes: str | None = None
+    planning_source: PlanningSource = "heuristic"
 
 
 class ToolRequest(BaseSchema):

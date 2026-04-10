@@ -375,6 +375,29 @@ class TextThemeArgs(BaseModel):
     question: str
 
 
+def _top_themes_for_text(
+    *,
+    text: str,
+    use_risk_themes: bool,
+    use_growth_themes: bool,
+) -> list[str]:
+    matched: list[str] = []
+    if use_risk_themes:
+        for theme_name, patterns in RISK_THEME_PATTERNS.items():
+            if any(pattern in text for pattern in patterns):
+                matched.append(theme_name)
+    if use_growth_themes:
+        for theme_name, patterns in GROWTH_THEME_PATTERNS.items():
+            if any(pattern in text for pattern in patterns):
+                matched.append(theme_name)
+    return matched
+
+
+def _format_theme_counts(theme_counts: list[tuple[str, int]], *, limit: int = 3) -> str:
+    trimmed = theme_counts[:limit]
+    return ", ".join(f"{theme.replace('_', ' ')} ({count})" for theme, count in trimmed)
+
+
 @tool(args_schema=TextThemeArgs)
 def text_theme_tool(ticker: str, chunk_rows: list[dict[str, Any]], question: str) -> dict[str, Any]:
     """Perform deterministic text analysis over retrieved chunk rows."""
@@ -390,8 +413,13 @@ def text_theme_tool(ticker: str, chunk_rows: list[dict[str, Any]], question: str
         if isinstance(token, str) and len(token) > 3 and token not in TEXT_THEME_STOPWORDS
     ]
     section_counter: Counter[str] = Counter()
+    source_counter: Counter[str] = Counter()
     keyword_counter: Counter[str] = Counter()
     theme_counter: Counter[str] = Counter()
+    source_theme_counters: dict[str, Counter[str]] = {
+        "sec_filing": Counter(),
+        "press_release": Counter(),
+    }
     supporting_records: list[dict[str, Any]] = []
     lowered_question = question.lower()
     use_risk_themes = "risk" in lowered_question
@@ -399,29 +427,46 @@ def text_theme_tool(ticker: str, chunk_rows: list[dict[str, Any]], question: str
 
     for row in chunk_rows:
         metadata = row.get("metadata_json", {}) or {}
+        source_type = str(row.get("source_type") or "unknown")
         section_label = str(metadata.get("section_label") or row.get("source_type") or "unknown")
         section_counter[section_label] += 1
+        source_counter[source_type] += 1
         text = str(row.get("chunk_text") or "").lower()
         for term in question_terms:
             if term in text:
                 keyword_counter[term] += text.count(term)
-        if use_risk_themes:
-            for theme_name, patterns in RISK_THEME_PATTERNS.items():
-                if any(pattern in text for pattern in patterns):
-                    theme_counter[theme_name] += 1
-        if use_growth_themes:
-            for theme_name, patterns in GROWTH_THEME_PATTERNS.items():
-                if any(pattern in text for pattern in patterns):
-                    theme_counter[theme_name] += 1
+        matched_themes = _top_themes_for_text(
+            text=text,
+            use_risk_themes=use_risk_themes,
+            use_growth_themes=use_growth_themes,
+        )
+        for theme_name in matched_themes:
+            theme_counter[theme_name] += 1
+            if source_type in source_theme_counters:
+                source_theme_counters[source_type][theme_name] += 1
         if len(supporting_records) < 5:
             supporting_records.append(_json_safe_value(row))
 
     dominant_section, dominant_count = section_counter.most_common(1)[0]
     top_keywords = keyword_counter.most_common(5)
     top_themes = theme_counter.most_common(5)
+    filing_top_themes = source_theme_counters["sec_filing"].most_common(5)
+    press_release_top_themes = source_theme_counters["press_release"].most_common(5)
     summary = f"Retrieved text evidence concentrates most heavily in {dominant_section} ({dominant_count} chunks)."
-    if top_themes:
-        summary += " Most visible themes: " + ", ".join(f"{theme.replace('_', ' ')} ({count})" for theme, count in top_themes) + "."
+    if filing_top_themes and press_release_top_themes:
+        summary += (
+            " Filing themes: "
+            + _format_theme_counts(filing_top_themes)
+            + ". Press-release themes: "
+            + _format_theme_counts(press_release_top_themes)
+            + "."
+        )
+    elif filing_top_themes:
+        summary += " Filing themes: " + _format_theme_counts(filing_top_themes) + "."
+    elif press_release_top_themes:
+        summary += " Press-release themes: " + _format_theme_counts(press_release_top_themes) + "."
+    elif top_themes:
+        summary += " Most visible themes: " + _format_theme_counts(top_themes, limit=5) + "."
     elif top_keywords:
         summary += " Most repeated question-linked terms: " + ", ".join(f"{term} ({count})" for term, count in top_keywords) + "."
 
@@ -436,6 +481,13 @@ def text_theme_tool(ticker: str, chunk_rows: list[dict[str, Any]], question: str
             "dominant_section_count": dominant_count,
             "top_keywords": top_keywords,
             "top_themes": top_themes,
+            "source_theme_breakdown": {
+                "sec_filing": filing_top_themes,
+                "press_release": press_release_top_themes,
+            },
+            "filing_top_themes": filing_top_themes,
+            "press_release_top_themes": press_release_top_themes,
+            "source_counts": source_counter.most_common(),
         },
     }
     return {"findings": [finding], "artifact_path": artifact_path, "summary": "Computed text-theme analysis."}
@@ -542,6 +594,96 @@ def _rank_findings_for_question(question: str, findings: list[dict[str, Any]]) -
     return sorted(findings, key=score)
 
 
+def _build_mixed_narrative_point(
+    *,
+    question: str,
+    text_finding: dict[str, Any] | None,
+    evidence_bundle: dict[str, Any],
+) -> str | None:
+    if not text_finding:
+        return None
+
+    qualitative_records = evidence_bundle.get("qualitative_records", []) or []
+    source_counter: Counter[str] = Counter(
+        str(record.get("source_type") or "")
+        for record in qualitative_records
+        if record.get("source_type")
+    )
+    metrics = text_finding.get("metrics", {}) or {}
+    top_themes = metrics.get("top_themes", []) or []
+    filing_themes = metrics.get("filing_top_themes", []) or metrics.get("source_theme_breakdown", {}).get("sec_filing", [])
+    press_release_themes = metrics.get("press_release_top_themes", []) or metrics.get("source_theme_breakdown", {}).get("press_release", [])
+    theme_names = [str(theme[0]).replace("_", " ") for theme in top_themes[:3] if isinstance(theme, (list, tuple)) and theme]
+    if not theme_names:
+        return str(text_finding.get("summary") or "") or None
+
+    if source_counter.get("sec_filing", 0) and source_counter.get("press_release", 0):
+        filing_theme_names = [
+            str(theme[0]).replace("_", " ")
+            for theme in filing_themes[:3]
+            if isinstance(theme, (list, tuple)) and theme
+        ]
+        press_theme_names = [
+            str(theme[0]).replace("_", " ")
+            for theme in press_release_themes[:3]
+            if isinstance(theme, (list, tuple)) and theme
+        ]
+        if filing_theme_names and press_theme_names:
+            return (
+                f"Filings emphasize {', '.join(filing_theme_names)} risk, while press releases lean more toward "
+                f"{', '.join(press_theme_names)} messaging."
+            )
+        return (
+            "Filings continue to emphasize risk and operating constraints, while press releases lean more toward growth messaging. "
+            f"The strongest shared themes in the retrieved text are {', '.join(theme_names)}."
+        )
+    if source_counter.get("sec_filing", 0):
+        filing_theme_names = [
+            str(theme[0]).replace("_", " ")
+            for theme in filing_themes[:3]
+            if isinstance(theme, (list, tuple)) and theme
+        ]
+        if filing_theme_names:
+            return f"Filing evidence remains the main qualitative support and highlights {', '.join(filing_theme_names)} risk."
+        return f"Filing evidence remains the main qualitative support and highlights themes such as {', '.join(theme_names)}."
+    if source_counter.get("press_release", 0):
+        press_theme_names = [
+            str(theme[0]).replace("_", " ")
+            for theme in press_release_themes[:3]
+            if isinstance(theme, (list, tuple)) and theme
+        ]
+        if press_theme_names:
+            return f"Press-release evidence is the main qualitative support and highlights themes such as {', '.join(press_theme_names)}."
+        return f"Press-release evidence is the main qualitative support and highlights themes such as {', '.join(theme_names)}."
+    return f"The strongest qualitative themes in the retrieved evidence are {', '.join(theme_names)}."
+
+
+def _build_fallback_answer_text(question: str, key_points: list[str], support_snippets: list[str]) -> str:
+    lowered_question = question.lower()
+    wants_mixed = any(term in lowered_question for term in ["risk", "growth", "press", "release", "filing", "filings"])
+    if wants_mixed and key_points:
+        lead_points = key_points[:3]
+        answer_parts = [
+            "Grounded analyst view based on collected NVDA evidence:",
+            f"The strongest support comes from {lead_points[0].lower()}",
+        ]
+        if len(lead_points) > 1:
+            answer_parts.append(f"Qualitative evidence adds that {lead_points[1].lower()}")
+        if len(lead_points) > 2:
+            answer_parts.append(f"A second financial signal shows that {lead_points[2].lower()}")
+        if support_snippets:
+            answer_parts.append("Primary source context included:")
+            answer_parts.extend(support_snippets[:2])
+        return "\n".join(answer_parts)
+
+    answer_parts = ["Grounded analyst view based on collected NVDA evidence:"]
+    answer_parts.extend(f"- {point}" for point in key_points[:3])
+    if support_snippets:
+        answer_parts.append("Primary source context included:")
+        answer_parts.extend(support_snippets[:2])
+    return "\n".join(answer_parts)
+
+
 def final_answer_builder(
     *,
     ticker: str,
@@ -571,20 +713,24 @@ def final_answer_builder(
         if source_url and source_url not in sources:
             sources.append(str(source_url))
 
+    text_finding = next((finding for finding in ranked_findings if finding.get("finding_type") == "text_theme"), None)
+    lowered_question = question.lower()
+    wants_mixed = any(term in lowered_question for term in ["risk", "growth", "press", "release", "filing", "filings"])
+    mixed_narrative_point = _build_mixed_narrative_point(question=question, text_finding=text_finding, evidence_bundle=evidence_bundle)
+
     for finding in selected_findings:
         summary = finding.get("summary")
         if summary:
             key_points.append(str(summary))
 
+    if wants_mixed and mixed_narrative_point:
+        key_points = [point for point in key_points if point != str(text_finding.get("summary") if text_finding else "")]
+        key_points.insert(1 if key_points else 0, mixed_narrative_point)
+
     if llm_summary:
         answer_text = llm_summary.strip()
     else:
-        answer_parts = ["Grounded analyst view based on collected NVDA evidence:"]
-        answer_parts.extend(f"- {point}" for point in key_points[:3])
-        if support_snippets:
-            answer_parts.append("Primary source context included:")
-            answer_parts.extend(support_snippets[:2])
-        answer_text = "\n".join(answer_parts)
+        answer_text = _build_fallback_answer_text(question, key_points, support_snippets)
 
     final_answer = FinalAnswer(
         company_ticker=ticker,

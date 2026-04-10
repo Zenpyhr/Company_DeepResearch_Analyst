@@ -45,9 +45,13 @@ def refresh_company_data(ticker: str) -> dict[str, int]:
     for record in market_records:
         upsert_market_record(record)
 
-    press_releases = fetch_press_releases(company)
-    for release in press_releases:
-        insert_source(release)
+    try:
+        press_releases = fetch_press_releases(company)
+        for release in press_releases:
+            insert_source(release)
+    except Exception as exc:  # pragma: no cover - runtime resilience path
+        logger.warning("Press release refresh failed for %s; continuing without press releases: %s", company.ticker, exc)
+        press_releases = []
 
     summary = {
         "filings": len(filings),

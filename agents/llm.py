@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.config import get_settings
@@ -48,3 +49,25 @@ class OptionalLLM:
         except Exception as exc:  # pragma: no cover - network/model failures are environment-specific
             logger.warning("LLM completion failed, falling back to deterministic path: %s", exc)
             return None
+
+    def complete_json(self, *, system_prompt: str, user_prompt: str, max_tokens: int = 500) -> dict[str, Any] | None:
+        raw = self.complete(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=max_tokens)
+        if not raw:
+            return None
+
+        candidate = raw.strip()
+        if candidate.startswith("```"):
+            candidate = candidate.strip("`")
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:].strip()
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = candidate[start : end + 1]
+
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            logger.warning("LLM JSON parsing failed, falling back to deterministic path: %s", exc)
+            return None
+        return parsed if isinstance(parsed, dict) else None

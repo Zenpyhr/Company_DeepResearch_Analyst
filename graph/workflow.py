@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from typing import Any, TypedDict
 
 try:
@@ -25,32 +26,50 @@ from agents.tools import (
 )
 from app.config import get_settings
 from app.logging import get_logger
-from prompts.agent_prompts import ANALYST_SYSTEM_PROMPT, EDA_SYSTEM_PROMPT, RESEARCHER_SYSTEM_PROMPT
-from schemas.models import AnalysisBundle, AnalysisFinding, EvidenceBundle, ResearchPlan, ToolResult
+from prompts.agent_prompts import ANALYST_SYSTEM_PROMPT, EDA_SYSTEM_PROMPT, ORCHESTRATOR_SYSTEM_PROMPT
+from schemas.models import (
+    AnalysisBundle,
+    AnalysisFinding,
+    EDAPlan,
+    EvidenceBundle,
+    OrchestrationPlan,
+    ResearchPlan,
+    RetrievalPlan,
+    RetryDecision,
+    ToolResult,
+)
 from storage.query_service import infer_anchor_dates_from_metrics
 
 
 logger = get_logger(__name__)
 
+ALLOWED_SOURCE_TYPES = {"sec_filing", "press_release"}
+ALLOWED_EDA_TOOLS = {"financial_trend_tool", "market_reaction_tool", "text_theme_tool", "chart_tool"}
+
 
 class AgentState(TypedDict, total=False):
-    # This is the shared state object passed between graph nodes.
-    # If you want to understand what one stage can hand to another, start here:
-    # the collector fills `research_plan` and `evidence_bundle`, the EDA stage fills
-    # `analysis_bundle`, and the analyst fills `final_answer`. The rest are control
-    # fields used for retries, chart artifacts, and debugging.
     question: str
     company_ticker: str
+    orchestration_plan: dict[str, Any]
     research_plan: dict[str, Any]
     evidence_bundle: dict[str, Any]
     analysis_bundle: dict[str, Any]
+    retry_decision: dict[str, Any]
     final_answer: dict[str, Any]
     chart_spec: dict[str, Any] | None
     chart_artifact_path: str | None
     memo_artifact_path: str | None
     loop_count: int
+    refresh_attempted: bool
     retry_requested: bool
-    missing_modalities: list[str]
+    routing_source: str
+    selected_tools: list[str]
+    requested_sources: list[str]
+    selected_sources: list[str]
+    retry_reason: str | None
+    clarification_needed: bool
+    clarification_question: str | None
+    clarification_reason: str | None
     execution_log: list[str]
 
 
@@ -68,11 +87,6 @@ def _contains_term(lowered: str, tokens: set[str], terms: set[str]) -> bool:
 
 
 def _classify_question(question: str) -> tuple[str, str]:
-    # This is the current routing brain for v1.
-    # It is intentionally simple and heuristic-driven: instead of letting an LLM choose
-    # the entire flow, we classify the question into a small set of categories so the
-    # system can deterministically decide whether it needs qualitative retrieval,
-    # quantitative retrieval, or both.
     lowered = question.lower()
     tokens = set(re.findall(r"[a-z0-9]+", lowered))
     financial_keywords = {"revenue", "income", "profit", "eps", "cash", "margin", "quarter", "quarters", "financial", "growth"}
@@ -108,59 +122,306 @@ def _metric_names_for_question(question: str) -> list[str]:
     return selected or ["revenue", "net_income", "gross_profit", "eps_diluted"]
 
 
-def _build_research_plan(question: str, ticker: str) -> ResearchPlan:
-    # The research plan is the first structured interpretation of the user's question.
-    # Its goal is not to answer anything yet; it translates the question into:
-    # - which modality is needed (`question_type`)
-    # - which analysis path we expect (`question_category`)
-    # - which tools the rest of the workflow is allowed to call
-    # This plan is then shown in the UI and reused by later stages.
-    question_category, question_type = _classify_question(question)
-    goals: list[str] = []
-    tools_to_call: list[str] = []
-    if question_category == "financial_trend":
-        goals = ["Retrieve recent financial metrics", "Compute period-over-period trend analysis"]
-        tools_to_call = ["retrieve_financial_metrics_tool", "financial_trend_tool"]
-    elif question_category == "market_reaction":
-        goals = ["Retrieve relevant market data", "Measure market reaction and volatility"]
-        tools_to_call = ["retrieve_market_data_tool", "market_reaction_tool"]
-    elif question_category == "risk_narrative":
-        goals = ["Retrieve filing and press-release context", "Identify repeated themes and risks"]
-        tools_to_call = ["retrieve_document_context_tool", "text_theme_tool"]
-    else:
-        goals = [
-            "Retrieve both qualitative and quantitative evidence",
-            "Analyze trends before writing a grounded memo",
-        ]
-        tools_to_call = [
-            "retrieve_document_context_tool",
-            "retrieve_financial_metrics_tool",
-            "retrieve_market_data_tool",
-            "financial_trend_tool",
-            "text_theme_tool",
-        ]
+def _derive_sub_intents(question: str, question_category: str, question_type: str) -> list[str]:
+    lowered = question.lower()
+    tokens = set(re.findall(r"[a-z0-9]+", lowered))
+    intents: list[str] = []
 
-    notes = "Deterministic routing is used by default; an LLM may refine the narrative if configured."
-    if LLM.available:
-        prompt = (
-            f"Question: {question}\n"
-            f"Current heuristic category: {question_category}\n"
-            f"Current heuristic type: {question_type}\n"
-            "Briefly refine the research goals in one or two sentences."
+    financial_terms = {"revenue", "income", "profit", "eps", "cash", "margin", "growth", "financial", "quarter", "quarters"}
+    market_terms = {"stock", "price", "market", "reaction", "return", "trading", "shares"}
+    risk_terms = {"risk", "risks", "filing", "filings", "press", "release", "releases", "narrative", "demand", "strategy"}
+
+    if question_category == "mixed":
+        if any(term in lowered or term in tokens for term in financial_terms):
+            intents.append("financial_trend")
+        if any(term in lowered or term in tokens for term in risk_terms):
+            intents.append("risk_narrative")
+        if any(term in lowered or term in tokens for term in market_terms):
+            intents.append("market_reaction")
+        if not intents:
+            intents = ["financial_trend", "risk_narrative"] if question_type == "mixed" else ["financial_trend"]
+        return intents
+
+    if question_category in {"financial_trend", "market_reaction", "risk_narrative"}:
+        return [question_category]
+    return ["financial_trend"]
+
+
+def _detect_clarification_need(question: str) -> tuple[bool, str | None, str | None]:
+    lowered = question.lower().strip()
+    tokens = re.findall(r"[a-z0-9]+", lowered)
+    if not lowered:
+        return True, "What do you want to analyze: financial performance, market reaction, risk disclosures, or growth narrative?", "The question is empty."
+
+    generic_patterns = [
+        "tell me about",
+        "what's going on",
+        "whats going on",
+        "what is going on",
+        "give me an update",
+        "analyze nvidia",
+        "look at nvidia",
+    ]
+    domain_tokens = {
+        "revenue",
+        "income",
+        "profit",
+        "eps",
+        "market",
+        "stock",
+        "price",
+        "reaction",
+        "risk",
+        "risks",
+        "filing",
+        "filings",
+        "press",
+        "release",
+        "growth",
+        "demand",
+        "guidance",
+        "margin",
+        "cash",
+    }
+    if any(pattern in lowered for pattern in generic_patterns):
+        return (
+            True,
+            "Do you want to focus on financial performance, market reaction, risk disclosures, or the growth narrative?",
+            "The question is broad and does not clearly state which type of analysis matters most.",
         )
-        llm_notes = LLM.complete(system_prompt=RESEARCHER_SYSTEM_PROMPT, user_prompt=prompt, max_tokens=150)
-        if llm_notes:
-            notes = llm_notes.strip()
+    if len(tokens) <= 4 and not any(token in domain_tokens for token in tokens):
+        return (
+            True,
+            "Could you clarify whether you want financials, stock reaction, risks, or growth-related evidence?",
+            "The question is too short to choose the best evidence path confidently.",
+        )
+    return False, None, None
 
-    return ResearchPlan(
+
+def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _heuristic_retrieval_plan(question: str, question_category: str, question_type: str) -> RetrievalPlan:
+    lowered = question.lower()
+    source_types = ["sec_filing", "press_release"] if question_type in {"qualitative", "mixed"} else []
+    if question_category == "risk_narrative" and "filing" in lowered:
+        source_types = ["sec_filing"]
+    explicit_market_request = any(
+        token in lowered for token in ["stock", "price", "market", "reaction"]
+    )
+    needs_market_data = question_category == "market_reaction" or explicit_market_request
+    metric_names = _metric_names_for_question(question) if question_type in {"quantitative", "mixed"} else []
+    return RetrievalPlan(
+        needs_qualitative=question_type in {"qualitative", "mixed"},
+        needs_quantitative=question_type in {"quantitative", "mixed"},
+        source_types=[source for source in source_types if source in ALLOWED_SOURCE_TYPES],
+        metric_names=metric_names,
+        limit_per_metric=4,
+        needs_market_data=needs_market_data,
+        anchor_date_count=1 if question_category == "market_reaction" else 2,
+        market_window_days=2 if needs_market_data else 3,
+    )
+
+
+def _heuristic_eda_plan(question: str, question_category: str, retrieval_plan: RetrievalPlan) -> EDAPlan:
+    selected_tools: list[str] = []
+    if question_category in {"financial_trend", "mixed"} and retrieval_plan.needs_quantitative:
+        selected_tools.append("financial_trend_tool")
+    if question_category in {"market_reaction", "mixed"} and retrieval_plan.needs_market_data:
+        selected_tools.append("market_reaction_tool")
+    if question_category in {"risk_narrative", "mixed"} and retrieval_plan.needs_qualitative:
+        selected_tools.append("text_theme_tool")
+    if any(tool in selected_tools for tool in ["financial_trend_tool", "market_reaction_tool"]):
+        selected_tools.append("chart_tool")
+    chart_metric = retrieval_plan.metric_names[0] if retrieval_plan.metric_names and "financial_trend_tool" in selected_tools else None
+    return EDAPlan(
+        selected_tools=selected_tools,
+        chart_metric=chart_metric,
+        notes=["Heuristic EDA planning is active unless the LLM planner overrides it."],
+    )
+
+
+def _heuristic_orchestration_plan(question: str, ticker: str) -> OrchestrationPlan:
+    question_category, question_type = _classify_question(question)
+    sub_intents = _derive_sub_intents(question, question_category, question_type)
+    retrieval_plan = _heuristic_retrieval_plan(question, question_category, question_type)
+    eda_plan = _heuristic_eda_plan(question, question_category, retrieval_plan)
+    return OrchestrationPlan(
         company_ticker=ticker,
         question=question,
         question_type=question_type,  # type: ignore[arg-type]
         question_category=question_category,  # type: ignore[arg-type]
-        goals=goals,
-        tools_to_call=tools_to_call,
-        notes=notes,
+        sub_intents=sub_intents,  # type: ignore[arg-type]
+        retrieval_plan=retrieval_plan,
+        eda_plan=eda_plan,
+        retry_policy={"allow_retry": True, "max_retries": 1},
+        notes=[
+            f"Heuristic category: {question_category}",
+            f"Heuristic type: {question_type}",
+            f"Heuristic sub-intents: {', '.join(sub_intents)}",
+        ],
+        confidence_notes="Deterministic planning fallback is available if LLM planning fails.",
+        planning_source="heuristic",
     )
+
+
+def _normalize_orchestration_plan(payload: dict[str, Any], fallback: OrchestrationPlan) -> OrchestrationPlan | None:
+    merged = _deep_merge(fallback.model_dump(mode="json"), payload)
+    retrieval_plan = merged.get("retrieval_plan", {})
+    eda_plan = merged.get("eda_plan", {})
+
+    retrieval_plan["source_types"] = [
+        source for source in retrieval_plan.get("source_types", []) if source in ALLOWED_SOURCE_TYPES
+    ]
+    if retrieval_plan.get("needs_qualitative") and not retrieval_plan["source_types"]:
+        retrieval_plan["source_types"] = fallback.retrieval_plan.source_types
+    retrieval_plan["limit_per_metric"] = max(1, min(int(retrieval_plan.get("limit_per_metric", 4)), 12))
+    retrieval_plan["anchor_date_count"] = max(1, min(int(retrieval_plan.get("anchor_date_count", 1)), 4))
+    retrieval_plan["market_window_days"] = max(1, min(int(retrieval_plan.get("market_window_days", 2)), 30))
+    retrieval_plan["metric_names"] = [str(metric) for metric in retrieval_plan.get("metric_names", []) if str(metric).strip()]
+    if retrieval_plan.get("needs_quantitative") and not retrieval_plan["metric_names"]:
+        retrieval_plan["metric_names"] = fallback.retrieval_plan.metric_names
+    if not retrieval_plan.get("needs_quantitative"):
+        retrieval_plan["needs_market_data"] = False
+    lowered_question = fallback.question.lower()
+    explicit_market_request = any(token in lowered_question for token in ["stock", "price", "market", "reaction"])
+    if fallback.question_category != "market_reaction" and not explicit_market_request:
+        retrieval_plan["needs_market_data"] = False
+
+    eda_plan["selected_tools"] = [tool for tool in eda_plan.get("selected_tools", []) if tool in ALLOWED_EDA_TOOLS]
+    if not eda_plan["selected_tools"]:
+        eda_plan["selected_tools"] = fallback.eda_plan.selected_tools
+    if not retrieval_plan.get("needs_qualitative"):
+        eda_plan["selected_tools"] = [tool for tool in eda_plan["selected_tools"] if tool != "text_theme_tool"]
+    if not retrieval_plan.get("needs_market_data"):
+        eda_plan["selected_tools"] = [tool for tool in eda_plan["selected_tools"] if tool != "market_reaction_tool"]
+    if not retrieval_plan.get("needs_quantitative"):
+        eda_plan["selected_tools"] = [tool for tool in eda_plan["selected_tools"] if tool != "financial_trend_tool"]
+    if "chart_tool" in eda_plan["selected_tools"] and not any(
+        tool in eda_plan["selected_tools"] for tool in ["financial_trend_tool", "market_reaction_tool"]
+    ):
+        eda_plan["selected_tools"] = [tool for tool in eda_plan["selected_tools"] if tool != "chart_tool"]
+    chart_metric = eda_plan.get("chart_metric")
+    if chart_metric and chart_metric not in retrieval_plan.get("metric_names", []):
+        eda_plan["chart_metric"] = retrieval_plan.get("metric_names", [None])[0]
+    if "chart_tool" in eda_plan["selected_tools"] and not eda_plan.get("chart_metric") and retrieval_plan.get("metric_names"):
+        eda_plan["chart_metric"] = retrieval_plan["metric_names"][0]
+    if "chart_tool" not in eda_plan["selected_tools"]:
+        eda_plan["chart_metric"] = None
+
+    merged["retrieval_plan"] = retrieval_plan
+    merged["eda_plan"] = eda_plan
+    if not merged.get("sub_intents"):
+        merged["sub_intents"] = fallback.sub_intents
+    merged["planning_source"] = "llm"
+
+    try:
+        return OrchestrationPlan.model_validate(merged)
+    except Exception as exc:  # pragma: no cover - validation path exercised indirectly
+        logger.warning("LLM orchestration plan validation failed, falling back to heuristic plan: %s", exc)
+        return None
+
+
+def _llm_orchestration_plan(question: str, ticker: str, fallback: OrchestrationPlan) -> OrchestrationPlan | None:
+    if not LLM.available:
+        return None
+
+    user_prompt = (
+        f"Question: {question}\n"
+        f"Ticker: {ticker}\n"
+        f"Fallback heuristic plan JSON: {json.dumps(fallback.model_dump(mode='json'), indent=2)}\n"
+        "Return JSON only with these top-level keys: "
+        "question_category, question_type, sub_intents, retrieval_plan, eda_plan, retry_policy, notes, confidence_notes.\n"
+        "Constraints:\n"
+        "- question_category must be one of financial_trend, market_reaction, risk_narrative, mixed\n"
+        "- question_type must be one of qualitative, quantitative, mixed\n"
+        "- sub_intents must be a list containing any of financial_trend, market_reaction, risk_narrative\n"
+        "- retrieval_plan.source_types can only include sec_filing and press_release\n"
+        "- eda_plan.selected_tools can only include financial_trend_tool, market_reaction_tool, text_theme_tool, chart_tool\n"
+        "- do not request market data unless the question genuinely needs price or reaction context\n"
+        "- do not request both qualitative and quantitative unless both are actually needed\n"
+        "- never answer the question; only plan the workflow\n"
+    )
+    payload = LLM.complete_json(system_prompt=ORCHESTRATOR_SYSTEM_PROMPT, user_prompt=user_prompt, max_tokens=700)
+    if not payload:
+        return None
+    payload["company_ticker"] = ticker
+    payload["question"] = question
+    return _normalize_orchestration_plan(payload, fallback)
+
+
+def _research_plan_from_orchestration(plan: OrchestrationPlan) -> ResearchPlan:
+    goals: list[str] = []
+    tools_to_call = list(plan.eda_plan.selected_tools)
+    if plan.retrieval_plan.needs_qualitative:
+        goals.append("Retrieve qualitative evidence from company documents")
+        tools_to_call.insert(0, "retrieve_document_context_tool")
+    if plan.retrieval_plan.needs_quantitative:
+        goals.append("Retrieve quantitative financial evidence")
+        tools_to_call.insert(0, "retrieve_financial_metrics_tool")
+    if plan.retrieval_plan.needs_market_data:
+        goals.append("Retrieve market evidence tied to the question")
+        tools_to_call.insert(1 if tools_to_call and tools_to_call[0] == "retrieve_financial_metrics_tool" else 0, "retrieve_market_data_tool")
+    if not goals:
+        goals.append("Retrieve the minimum evidence needed to answer the question safely")
+    note_text = " ".join(plan.notes).strip() or None
+    return ResearchPlan(
+        company_ticker=plan.company_ticker,
+        question=plan.question,
+        question_type=plan.question_type,
+        question_category=plan.question_category,
+        sub_intents=plan.sub_intents,
+        goals=goals,
+        tools_to_call=list(dict.fromkeys(tools_to_call)),
+        notes=note_text,
+    )
+
+
+def _planner_node(state: AgentState) -> AgentState:
+    question = state["question"]
+    ticker = state.get("company_ticker") or get_settings().default_ticker
+    clarification_needed, clarification_question, clarification_reason = _detect_clarification_need(question)
+    heuristic_plan = _heuristic_orchestration_plan(question, ticker)
+    orchestration_plan = _llm_orchestration_plan(question, ticker, heuristic_plan) or heuristic_plan
+    if clarification_needed and clarification_reason:
+        orchestration_plan = orchestration_plan.model_copy(
+            update={
+                "notes": [
+                    *orchestration_plan.notes,
+                    f"Clarification suggested: {clarification_reason}",
+                ]
+            }
+        )
+    research_plan = _research_plan_from_orchestration(orchestration_plan)
+    routing_source = "llm" if orchestration_plan.planning_source == "llm" else "heuristic_fallback"
+    selected_tools = list(dict.fromkeys(orchestration_plan.eda_plan.selected_tools))
+    if orchestration_plan.retrieval_plan.needs_qualitative:
+        selected_tools.insert(0, "retrieve_document_context_tool")
+    if orchestration_plan.retrieval_plan.needs_quantitative:
+        selected_tools.insert(0, "retrieve_financial_metrics_tool")
+    if orchestration_plan.retrieval_plan.needs_market_data:
+        selected_tools.append("retrieve_market_data_tool")
+
+    return {
+        "company_ticker": ticker,
+        "orchestration_plan": orchestration_plan.model_dump(),
+        "research_plan": research_plan.model_dump(),
+        "routing_source": routing_source,
+        "selected_tools": list(dict.fromkeys(selected_tools)),
+        "requested_sources": orchestration_plan.retrieval_plan.source_types,
+        "selected_sources": orchestration_plan.retrieval_plan.source_types,
+        "clarification_needed": clarification_needed,
+        "clarification_question": clarification_question,
+        "clarification_reason": clarification_reason,
+        "execution_log": [*state.get("execution_log", []), f"planner:{routing_source}"],
+    }
 
 
 def _merge_records(existing: list[dict[str, Any]], incoming: list[dict[str, Any]], key_fields: list[str]) -> list[dict[str, Any]]:
@@ -176,18 +437,10 @@ def _merge_records(existing: list[dict[str, Any]], incoming: list[dict[str, Any]
 
 
 def _collector_node(state: AgentState) -> AgentState:
-    # The Collector node is responsible for turning a user question into an EvidenceBundle.
-    # It does not analyze or conclude. Its job is narrower:
-    # - decide which retrieval modality is needed from the research plan
-    # - call retrieval tools
-    # - merge results into one structured package
-    # - optionally refresh source data if the local store is empty
-    #
-    # If you want to understand "where does the data come from before EDA?", this is the
-    # most important function to read.
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
-    plan = _build_research_plan(question, ticker)
+    plan = OrchestrationPlan.model_validate(state["orchestration_plan"])
+    retrieval_plan = plan.retrieval_plan
     evidence_bundle = EvidenceBundle.model_validate(
         state.get("evidence_bundle")
         or {
@@ -199,30 +452,29 @@ def _collector_node(state: AgentState) -> AgentState:
             "tool_results": [],
         }
     )
-    missing_modalities = state.get("missing_modalities", [])
+    retry_decision = RetryDecision.model_validate(state.get("retry_decision") or {})
     next_loop_count = state.get("loop_count", 0)
-    if missing_modalities and state.get("analysis_bundle") and next_loop_count < 1:
+    if retry_decision.retry_requested and state.get("analysis_bundle") and next_loop_count < 1:
         next_loop_count += 1
-    # These flags are the main bridge from the research plan to actual retrieval.
-    # For example:
-    # - qualitative question -> only document chunks
-    # - quantitative question -> financial metrics, plus market data if relevant
-    # - mixed question -> both
-    # The EDA stage can also ask for a retry by populating `missing_modalities`.
-    needs_qualitative = plan.question_type in {"qualitative", "mixed"} or "qualitative" in missing_modalities
-    needs_quantitative = plan.question_type in {"quantitative", "mixed"} or "quantitative" in missing_modalities
 
     execution_log = list(state.get("execution_log", []))
-    if needs_qualitative:
-        # Qualitative retrieval means "find the most relevant text passages" from SEC filings
-        # and press releases. The returned rows are stored separately from quantitative rows so
-        # later stages can choose the right analysis tool for each modality.
-        source_types = ["sec_filing", "press_release"]
-        lowered = question.lower()
-        if plan.question_category == "risk_narrative" and "filing" in lowered:
-            source_types = ["sec_filing"]
+    effective_source_types = retrieval_plan.source_types or []
+    if retry_decision.missing_sources:
+        effective_source_types = [
+            source for source in dict.fromkeys([*effective_source_types, *retry_decision.missing_sources]) if source in ALLOWED_SOURCE_TYPES
+        ]
+    effective_metric_names = retrieval_plan.metric_names or []
+    if retry_decision.missing_metrics:
+        effective_metric_names = [metric for metric in dict.fromkeys([*effective_metric_names, *retry_decision.missing_metrics]) if metric]
+
+    if retrieval_plan.needs_qualitative:
         qualitative_result = retrieve_document_context_tool.invoke(
-            {"ticker": ticker, "question": question, "top_k": 6, "source_types": source_types}
+            {
+                "ticker": ticker,
+                "question": question,
+                "top_k": 6,
+                "source_types": effective_source_types,
+            }
         )
         evidence_bundle.qualitative_records = _merge_records(
             evidence_bundle.qualitative_records,
@@ -233,13 +485,21 @@ def _collector_node(state: AgentState) -> AgentState:
         evidence_bundle.retrieval_notes.append(qualitative_result["summary"])
         execution_log.append("retrieve_document_context_tool")
 
-    if needs_quantitative:
-        # Quantitative retrieval starts with structured financial rows because most numeric
-        # company questions need period-based metrics first. Market data is only added when
-        # the question suggests price/return behavior or when the question category is mixed.
-        metric_names = _metric_names_for_question(question)
+    actual_retrieved_sources = sorted(
+        {
+            str(record.get("source_type"))
+            for record in evidence_bundle.qualitative_records
+            if record.get("source_type")
+        }
+    )
+
+    if retrieval_plan.needs_quantitative:
         metrics_result = retrieve_financial_metrics_tool.invoke(
-            {"ticker": ticker, "metric_names": metric_names, "limit_per_metric": 4}
+            {
+                "ticker": ticker,
+                "metric_names": effective_metric_names,
+                "limit_per_metric": retrieval_plan.limit_per_metric,
+            }
         )
         metric_rows = [{**record, "record_kind": "financial_metric"} for record in metrics_result["records"]]
         evidence_bundle.quantitative_records = _merge_records(
@@ -251,15 +511,18 @@ def _collector_node(state: AgentState) -> AgentState:
         evidence_bundle.retrieval_notes.append(metrics_result["summary"])
         execution_log.append("retrieve_financial_metrics_tool")
 
-        lowered = question.lower()
-        if plan.question_category in {"market_reaction", "mixed"} or any(keyword in lowered for keyword in ["stock", "price", "market", "reaction"]):
-            # Anchor dates tie market retrieval back to the retrieved company metrics.
-            # This lets us ask for a local price window around financially relevant dates
-            # instead of always fetching an arbitrary rolling market slice.
-            max_anchor_dates = 1 if plan.question_category == "market_reaction" else 2
-            anchor_dates = infer_anchor_dates_from_metrics(metrics_result["records"], max_dates=max_anchor_dates)
+        if retrieval_plan.needs_market_data:
+            anchor_dates = infer_anchor_dates_from_metrics(
+                metrics_result["records"],
+                max_dates=retrieval_plan.anchor_date_count,
+            )
             market_result = retrieve_market_data_tool.invoke(
-                {"ticker": ticker, "anchor_dates": anchor_dates, "window_days": 2, "limit": 20}
+                {
+                    "ticker": ticker,
+                    "anchor_dates": anchor_dates,
+                    "window_days": retrieval_plan.market_window_days,
+                    "limit": 20,
+                }
             )
             market_rows = [{**record, "record_kind": "market_data"} for record in market_result["records"]]
             evidence_bundle.quantitative_records = _merge_records(
@@ -274,88 +537,120 @@ def _collector_node(state: AgentState) -> AgentState:
     if (
         not evidence_bundle.qualitative_records
         and not evidence_bundle.quantitative_records
-        and state.get("loop_count", 0) == 0
+        and not state.get("refresh_attempted", False)
     ):
-        # This recovery path is what keeps the app usable on a fresh machine.
-        # If retrieval returns nothing on the first pass, we try to refresh the local
-        # company dataset and then rerun the same retrieval logic one more time.
         try:
             refresh_result = refresh_company_data_tool.invoke({"ticker": ticker})
             evidence_bundle.retrieval_notes.append(
                 f"Refresh/process step completed: {refresh_result['refresh_summary']} and {refresh_result['process_summary']}"
             )
             execution_log.append("refresh_company_data_tool")
-            if needs_qualitative:
-                qualitative_result = retrieve_document_context_tool.invoke(
-                    {
-                        "ticker": ticker,
-                        "question": question,
-                        "top_k": 6,
-                        "source_types": ["sec_filing"] if plan.question_category == "risk_narrative" and "filing" in question.lower() else ["sec_filing", "press_release"],
-                    }
-                )
-                evidence_bundle.qualitative_records = _merge_records(
-                    evidence_bundle.qualitative_records,
-                    qualitative_result["records"],
-                    ["id", "source_id", "chunk_order"],
-                )
-                evidence_bundle.tool_results.append(ToolResult.model_validate(qualitative_result))
-                evidence_bundle.retrieval_notes.append(qualitative_result["summary"])
-                execution_log.append("retrieve_document_context_tool")
-            if needs_quantitative:
-                metrics_result = retrieve_financial_metrics_tool.invoke(
-                    {"ticker": ticker, "metric_names": _metric_names_for_question(question), "limit_per_metric": 4}
-                )
-                metric_rows = [{**record, "record_kind": "financial_metric"} for record in metrics_result["records"]]
-                evidence_bundle.quantitative_records = _merge_records(
-                    evidence_bundle.quantitative_records,
-                    metric_rows,
-                    ["id", "record_kind"],
-                )
-                evidence_bundle.tool_results.append(ToolResult.model_validate(metrics_result))
-                evidence_bundle.retrieval_notes.append(metrics_result["summary"])
-                execution_log.append("retrieve_financial_metrics_tool")
-                lowered = question.lower()
-                if plan.question_category in {"market_reaction", "mixed"} or any(keyword in lowered for keyword in ["stock", "price", "market", "reaction"]):
-                    max_anchor_dates = 1 if plan.question_category == "market_reaction" else 2
-                    anchor_dates = infer_anchor_dates_from_metrics(metrics_result["records"], max_dates=max_anchor_dates)
-                    market_result = retrieve_market_data_tool.invoke(
-                        {"ticker": ticker, "anchor_dates": anchor_dates, "window_days": 2, "limit": 20}
-                    )
-                    market_rows = [{**record, "record_kind": "market_data"} for record in market_result["records"]]
-                    evidence_bundle.quantitative_records = _merge_records(
-                        evidence_bundle.quantitative_records,
-                        market_rows,
-                        ["id", "record_kind"],
-                    )
-                    evidence_bundle.tool_results.append(ToolResult.model_validate(market_result))
-                    evidence_bundle.retrieval_notes.append(market_result["summary"])
-                    execution_log.append("retrieve_market_data_tool")
+            return _collector_node(
+                {
+                    **state,
+                    "loop_count": next_loop_count,
+                    "refresh_attempted": True,
+                    "evidence_bundle": evidence_bundle.model_dump(),
+                    "execution_log": execution_log,
+                    "retry_decision": RetryDecision(retry_requested=False).model_dump(),
+                }
+            )
         except Exception as exc:
             evidence_bundle.retrieval_notes.append(f"Refresh skipped or failed: {exc}")
 
     return {
         "company_ticker": ticker,
-        "research_plan": plan.model_dump(),
         "evidence_bundle": evidence_bundle.model_dump(),
         "loop_count": next_loop_count,
         "retry_requested": False,
         "execution_log": execution_log,
+        "requested_sources": effective_source_types,
+        "selected_sources": actual_retrieved_sources,
     }
 
 
+def _build_retry_decision(
+    *,
+    plan: OrchestrationPlan,
+    evidence_bundle: EvidenceBundle,
+    findings: list[AnalysisFinding],
+    loop_count: int,
+) -> RetryDecision:
+    missing_modalities: list[str] = []
+    missing_sources: list[str] = []
+    missing_metrics: list[str] = []
+    reasons: list[str] = []
+
+    if plan.retrieval_plan.needs_qualitative and not evidence_bundle.qualitative_records:
+        missing_modalities.append("qualitative")
+        missing_sources.extend(plan.retrieval_plan.source_types)
+    if plan.retrieval_plan.needs_quantitative and not evidence_bundle.quantitative_records:
+        missing_modalities.append("quantitative")
+        missing_metrics.extend(plan.retrieval_plan.metric_names)
+
+    present_tools = {finding.finding_type for finding in findings}
+    if "financial_trend_tool" in plan.eda_plan.selected_tools and "financial_trend" not in present_tools:
+        missing_metrics.extend(plan.retrieval_plan.metric_names)
+        reasons.append("Financial analysis tool had insufficient metric evidence.")
+    if "market_reaction_tool" in plan.eda_plan.selected_tools and "market_reaction" not in present_tools:
+        missing_modalities.append("quantitative")
+        reasons.append("Market reaction tool had insufficient market rows.")
+    if "text_theme_tool" in plan.eda_plan.selected_tools and "text_theme" not in present_tools:
+        missing_modalities.append("qualitative")
+        missing_sources.extend(plan.retrieval_plan.source_types)
+        reasons.append("Text analysis tool had insufficient qualitative evidence.")
+
+    retry_requested = bool((missing_modalities or reasons) and loop_count < int(plan.retry_policy.get("max_retries", 1)))
+    if not reasons and retry_requested:
+        reasons.append("Evidence bundle was incomplete for the planned analysis path.")
+
+    return RetryDecision(
+        retry_requested=retry_requested and bool(plan.retry_policy.get("allow_retry", True)),
+        missing_modalities=sorted(set(missing_modalities)),
+        missing_sources=sorted(set(missing_sources)),
+        missing_metrics=sorted(set(missing_metrics)),
+        reason=" ".join(reasons).strip() or None,
+    )
+
+
+def _llm_retry_decision(
+    *,
+    plan: OrchestrationPlan,
+    evidence_bundle: EvidenceBundle,
+    analysis_findings: list[AnalysisFinding],
+    fallback: RetryDecision,
+    loop_count: int,
+) -> RetryDecision:
+    if not LLM.available:
+        return fallback
+
+    prompt = (
+        f"Question: {plan.question}\n"
+        f"Loop count: {loop_count}\n"
+        f"Orchestration plan: {json.dumps(plan.model_dump(mode='json'), indent=2)}\n"
+        f"Evidence counts: qualitative={len(evidence_bundle.qualitative_records)}, quantitative={len(evidence_bundle.quantitative_records)}\n"
+        f"Analysis findings: {json.dumps([finding.model_dump(mode='json') for finding in analysis_findings], indent=2)}\n"
+        f"Fallback retry decision JSON: {json.dumps(fallback.model_dump(mode='json'), indent=2)}\n"
+        "Return JSON only with keys: retry_requested, missing_modalities, missing_sources, missing_metrics, reason.\n"
+        "Never request more than one additional retry and do not answer the question."
+    )
+    payload = LLM.complete_json(system_prompt=EDA_SYSTEM_PROMPT, user_prompt=prompt, max_tokens=250)
+    if not payload:
+        return fallback
+
+    merged = _deep_merge(fallback.model_dump(mode="json"), payload)
+    merged["retry_requested"] = bool(merged.get("retry_requested")) and loop_count < int(plan.retry_policy.get("max_retries", 1))
+    try:
+        return RetryDecision.model_validate(merged)
+    except Exception as exc:  # pragma: no cover - validation path exercised indirectly
+        logger.warning("LLM retry decision validation failed, falling back to deterministic retry logic: %s", exc)
+        return fallback
+
+
 def _eda_node(state: AgentState) -> AgentState:
-    # The EDA node is where raw evidence becomes explicit findings.
-    # It receives the EvidenceBundle from the Collector, separates the records by modality,
-    # runs the appropriate analysis tools, and returns an AnalysisBundle that is much easier
-    # for the Analyst to synthesize.
-    #
-    # In other words:
-    # Collector output = "here is what we found"
-    # EDA output       = "here is what those records appear to show"
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
-    plan = ResearchPlan.model_validate(state["research_plan"])
+    plan = OrchestrationPlan.model_validate(state["orchestration_plan"])
     evidence_bundle = EvidenceBundle.model_validate(state["evidence_bundle"])
     execution_log = list(state.get("execution_log", []))
 
@@ -363,114 +658,124 @@ def _eda_node(state: AgentState) -> AgentState:
     metric_rows = [record for record in quantitative_records if record.get("record_kind") == "financial_metric"]
     market_rows = [record for record in quantitative_records if record.get("record_kind") == "market_data"]
     qualitative_records = evidence_bundle.qualitative_records
-    # Splitting the evidence bundle here is what lets one agent's output become another
-    # agent's input in a clean way. The Collector hands EDA one mixed package, and EDA
-    # decomposes it into the exact slices needed for each analysis tool.
 
     findings: list[AnalysisFinding] = []
-    notes: list[str] = []
+    notes: list[str] = list(plan.eda_plan.notes)
     chart_spec: dict[str, Any] | None = None
     chart_artifact_path: str | None = None
+    selected_tools_executed: list[str] = []
 
-    if plan.question_category in {"financial_trend", "mixed"} and metric_rows:
-        # Financial trend analysis is deterministic: it compares recent metric rows and
-        # computes concrete deltas/percent changes. This is the part that most directly
-        # satisfies the assignment's "explore and analyze" requirement for numeric data.
-        trend_result = financial_trend_tool.invoke({"ticker": ticker, "metric_rows": metric_rows})
-        findings.extend(AnalysisFinding.model_validate(finding) for finding in trend_result["findings"])
-        if trend_result.get("artifact_path"):
-            notes.append(f"Financial trend artifact saved to {trend_result['artifact_path']}")
-        execution_log.append("financial_trend_tool")
+    for tool_name in plan.eda_plan.selected_tools:
+        if tool_name == "financial_trend_tool":
+            if not metric_rows:
+                notes.append("Skipped financial_trend_tool because no financial metric rows were available.")
+                continue
+            trend_result = financial_trend_tool.invoke({"ticker": ticker, "metric_rows": metric_rows})
+            findings.extend(AnalysisFinding.model_validate(finding) for finding in trend_result["findings"])
+            if trend_result.get("artifact_path"):
+                notes.append(f"Financial trend artifact saved to {trend_result['artifact_path']}")
+            execution_log.append("financial_trend_tool")
+            selected_tools_executed.append("financial_trend_tool")
+            continue
 
-        first_metric = metric_rows[0].get("metric_name") if metric_rows else None
-        if first_metric:
-            chart_rows = [
-                {"fiscal_period": row.get("fiscal_period"), "metric_value": row.get("metric_value")}
-                for row in metric_rows
-                if row.get("metric_name") == first_metric
-            ]
-            chart_result = chart_tool.invoke(
+        if tool_name == "market_reaction_tool":
+            if not market_rows:
+                notes.append("Skipped market_reaction_tool because no market rows were available.")
+                continue
+            market_result = market_reaction_tool.invoke(
                 {
                     "ticker": ticker,
-                    "title": f"{first_metric.replace('_', ' ').title()} trend",
-                    "rows": list(reversed(chart_rows)),
-                    "x_field": "fiscal_period",
-                    "y_field": "metric_value",
+                    "market_rows": market_rows,
+                    "anchor_dates": infer_anchor_dates_from_metrics(
+                        metric_rows,
+                        max_dates=plan.retrieval_plan.anchor_date_count,
+                    ),
                 }
             )
-            chart_spec = chart_result.get("chart_spec")
-            chart_artifact_path = chart_result.get("artifact_path")
-            execution_log.append("chart_tool")
+            findings.extend(AnalysisFinding.model_validate(finding) for finding in market_result["findings"])
+            execution_log.append("market_reaction_tool")
+            selected_tools_executed.append("market_reaction_tool")
+            continue
 
-    if plan.question_category in {"market_reaction", "mixed"} and market_rows:
-        # Market reaction analysis is optional for many questions, but it becomes useful
-        # whenever the prompt asks about stock behavior or when mixed evidence should
-        # connect financial events to price movement.
-        market_result = market_reaction_tool.invoke(
-            {
-                "ticker": ticker,
-                "market_rows": market_rows,
-                "anchor_dates": infer_anchor_dates_from_metrics(
-                    metric_rows,
-                    max_dates=1 if plan.question_category == "market_reaction" else 2,
-                ),
-            }
-        )
-        findings.extend(AnalysisFinding.model_validate(finding) for finding in market_result["findings"])
-        if not chart_spec and market_rows:
-            chart_rows = [
-                {"date": str(row.get("date", ""))[:10], "close": row.get("close")}
-                for row in market_rows
-                if row.get("close") is not None
-            ]
-            chart_result = chart_tool.invoke(
-                {
-                    "ticker": ticker,
-                    "title": "NVDA market window",
-                    "rows": chart_rows,
-                    "x_field": "date",
-                    "y_field": "close",
-                }
-            )
-            chart_spec = chart_result.get("chart_spec")
-            chart_artifact_path = chart_result.get("artifact_path")
-            execution_log.append("chart_tool")
-        execution_log.append("market_reaction_tool")
+        if tool_name == "text_theme_tool":
+            if not qualitative_records:
+                notes.append("Skipped text_theme_tool because no qualitative records were available.")
+                continue
+            text_result = text_theme_tool.invoke({"ticker": ticker, "chunk_rows": qualitative_records, "question": question})
+            findings.extend(AnalysisFinding.model_validate(finding) for finding in text_result["findings"])
+            execution_log.append("text_theme_tool")
+            selected_tools_executed.append("text_theme_tool")
+            continue
 
-    if plan.question_category in {"risk_narrative", "mixed"} and qualitative_records:
-        # Text-theme analysis is the qualitative EDA path. It turns retrieved chunks into
-        # tractable signals such as repeated sections and question-linked terms instead of
-        # relying on the final analyst step to parse raw text ad hoc.
-        text_result = text_theme_tool.invoke({"ticker": ticker, "chunk_rows": qualitative_records, "question": question})
-        findings.extend(AnalysisFinding.model_validate(finding) for finding in text_result["findings"])
-        execution_log.append("text_theme_tool")
+        if tool_name == "chart_tool":
+            chart_metric = plan.eda_plan.chart_metric
+            if chart_metric and metric_rows:
+                chart_rows = [
+                    {"fiscal_period": row.get("fiscal_period"), "metric_value": row.get("metric_value")}
+                    for row in metric_rows
+                    if row.get("metric_name") == chart_metric
+                ]
+                if chart_rows:
+                    chart_result = chart_tool.invoke(
+                        {
+                            "ticker": ticker,
+                            "title": f"{chart_metric.replace('_', ' ').title()} trend",
+                            "rows": list(reversed(chart_rows)),
+                            "x_field": "fiscal_period",
+                            "y_field": "metric_value",
+                        }
+                    )
+                    chart_spec = chart_result.get("chart_spec")
+                    chart_artifact_path = chart_result.get("artifact_path")
+                    execution_log.append("chart_tool")
+                    selected_tools_executed.append("chart_tool")
+                    continue
+            if market_rows and not chart_spec:
+                chart_rows = [
+                    {"date": str(row.get("date", ""))[:10], "close": row.get("close")}
+                    for row in market_rows
+                    if row.get("close") is not None
+                ]
+                if chart_rows:
+                    chart_result = chart_tool.invoke(
+                        {
+                            "ticker": ticker,
+                            "title": "NVDA market window",
+                            "rows": chart_rows,
+                            "x_field": "date",
+                            "y_field": "close",
+                        }
+                    )
+                    chart_spec = chart_result.get("chart_spec")
+                    chart_artifact_path = chart_result.get("artifact_path")
+                    execution_log.append("chart_tool")
+                    selected_tools_executed.append("chart_tool")
+                else:
+                    notes.append("Skipped chart_tool because there were no chartable rows.")
+            else:
+                notes.append("Skipped chart_tool because no chartable rows were available.")
 
-    missing_modalities: list[str] = []
-    requires_additional_research = False
-    if plan.question_category == "mixed":
-        if not qualitative_records:
-            missing_modalities.append("qualitative")
-        if not quantitative_records:
-            missing_modalities.append("quantitative")
-    if not findings:
-        if not qualitative_records:
-            missing_modalities.append("qualitative")
-        if not quantitative_records:
-            missing_modalities.append("quantitative")
-
-    if missing_modalities and state.get("loop_count", 0) < 1:
-        # This is the current non-linear part of the graph.
-        # If EDA concludes that the bundle is incomplete for the question, it does not
-        # force the Analyst to guess. Instead it asks the graph to go back to the Collector
-        # for one extra retrieval pass.
-        requires_additional_research = True
-        notes.append(f"EDA requested another retrieval pass for: {', '.join(sorted(set(missing_modalities)))}.")
+    fallback_retry = _build_retry_decision(
+        plan=plan,
+        evidence_bundle=evidence_bundle,
+        findings=findings,
+        loop_count=state.get("loop_count", 0),
+    )
+    retry_decision = _llm_retry_decision(
+        plan=plan,
+        evidence_bundle=evidence_bundle,
+        analysis_findings=findings,
+        fallback=fallback_retry,
+        loop_count=state.get("loop_count", 0),
+    )
+    if retry_decision.reason:
+        notes.append(retry_decision.reason)
 
     if LLM.available and findings:
         prompt = (
             f"Question: {question}\n"
-            f"Research plan: {json.dumps(plan.model_dump(mode='json'), indent=2, default=str)}\n"
-            f"Current findings: {json.dumps([finding.model_dump(mode='json') for finding in findings], indent=2, default=str)}\n"
+            f"Orchestration plan: {json.dumps(plan.model_dump(mode='json'), indent=2)}\n"
+            f"Current findings: {json.dumps([finding.model_dump(mode='json') for finding in findings], indent=2)}\n"
             "Write one short note describing the strongest EDA takeaway."
         )
         llm_note = LLM.complete(system_prompt=EDA_SYSTEM_PROMPT, user_prompt=prompt, max_tokens=120)
@@ -482,49 +787,44 @@ def _eda_node(state: AgentState) -> AgentState:
         question=question,
         findings=findings,
         notes=notes,
-        requires_additional_research=requires_additional_research,
-        missing_modalities=sorted(set(missing_modalities)),
+        requires_additional_research=retry_decision.retry_requested,
+        missing_modalities=retry_decision.missing_modalities,
     )
 
     return {
         "analysis_bundle": analysis_bundle.model_dump(),
+        "retry_decision": retry_decision.model_dump(),
         "chart_spec": chart_spec,
         "chart_artifact_path": chart_artifact_path,
-        "missing_modalities": analysis_bundle.missing_modalities,
-        "retry_requested": requires_additional_research,
+        "retry_requested": retry_decision.retry_requested,
+        "retry_reason": retry_decision.reason,
+        "selected_tools": list(dict.fromkeys(state.get("selected_tools", []) + selected_tools_executed)),
         "execution_log": execution_log,
     }
 
 
 def _route_after_eda(state: AgentState) -> str:
-    # LangGraph uses this router to decide whether the next node should be another
-    # collection pass or the final analyst synthesis.
-    analysis_bundle = AnalysisBundle.model_validate(state["analysis_bundle"])
-    if analysis_bundle.requires_additional_research and state.get("loop_count", 0) < 1:
+    retry_decision = RetryDecision.model_validate(state.get("retry_decision") or {})
+    if retry_decision.retry_requested and state.get("loop_count", 0) < 1:
         return "collector"
     return "analyst"
 
 
 def _analyst_node(state: AgentState) -> AgentState:
-    # The Analyst node is deliberately late in the workflow.
-    # By the time we get here, the system should already have:
-    # - a research plan
-    # - a concrete evidence bundle
-    # - explicit EDA findings
-    # The analyst's goal is to synthesize, prioritize, and explain those findings,
-    # not to discover brand-new evidence.
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
     evidence_bundle = EvidenceBundle.model_validate(state["evidence_bundle"])
     analysis_bundle = AnalysisBundle.model_validate(state["analysis_bundle"])
+    orchestration_plan = OrchestrationPlan.model_validate(state["orchestration_plan"])
     execution_log = list(state.get("execution_log", []))
 
     llm_summary: str | None = None
     if LLM.available:
         prompt = (
             f"Question: {question}\n"
-            f"Evidence bundle: {json.dumps(evidence_bundle.model_dump(mode='json'), indent=2, default=str)}\n"
-            f"EDA findings: {json.dumps(analysis_bundle.model_dump(mode='json'), indent=2, default=str)}\n"
+            f"Orchestration plan: {json.dumps(orchestration_plan.model_dump(mode='json'), indent=2)}\n"
+            f"Evidence bundle: {json.dumps(evidence_bundle.model_dump(mode='json'), indent=2)}\n"
+            f"EDA findings: {json.dumps(analysis_bundle.model_dump(mode='json'), indent=2)}\n"
             "Write a concise grounded analyst answer with 2-3 short paragraphs."
         )
         llm_summary = LLM.complete(system_prompt=ANALYST_SYSTEM_PROMPT, user_prompt=prompt, max_tokens=350)
@@ -536,8 +836,6 @@ def _analyst_node(state: AgentState) -> AgentState:
         evidence_bundle=evidence_bundle.model_dump(),
         llm_summary=llm_summary,
     )
-    # `final_answer_builder` is the last structured handoff in the pipeline:
-    # EDA findings + evidence bundle -> FinalAnswer + memo artifact.
     execution_log.append("final_answer_builder")
 
     return {
@@ -550,6 +848,7 @@ def _analyst_node(state: AgentState) -> AgentState:
 class _FallbackWorkflow:
     def invoke(self, initial_state: AgentState) -> AgentState:
         state = dict(initial_state)
+        state.update(_planner_node(state))
         state.update(_collector_node(state))
         state.update(_eda_node(state))
         if _route_after_eda(state) == "collector":
@@ -560,21 +859,17 @@ class _FallbackWorkflow:
 
 
 def build_workflow():
-    # This is the actual graph definition.
-    # Right now the shape is intentionally simple:
-    # START -> collector -> eda -> analyst -> END
-    # with one possible loop from EDA back to Collector.
-    # If we later add routing, parallel branches, or a critic agent, this is the place
-    # where the high-level system structure will evolve.
     if StateGraph is None:
         logger.info("LangGraph is unavailable in this environment; using fallback sequential workflow.")
         return _FallbackWorkflow()
 
     graph = StateGraph(AgentState)
+    graph.add_node("planner", _planner_node)
     graph.add_node("collector", _collector_node)
     graph.add_node("eda", _eda_node)
     graph.add_node("analyst", _analyst_node)
-    graph.add_edge(START, "collector")
+    graph.add_edge(START, "planner")
+    graph.add_edge("planner", "collector")
     graph.add_edge("collector", "eda")
     graph.add_conditional_edges("eda", _route_after_eda, {"collector": "collector", "analyst": "analyst"})
     graph.add_edge("analyst", END)
@@ -590,7 +885,7 @@ def run_analyst_workflow(question: str, company_ticker: str | None = None) -> di
         "question": question,
         "company_ticker": ticker,
         "loop_count": 0,
+        "refresh_attempted": False,
         "execution_log": [],
     }
-
     return WORKFLOW.invoke(initial_state)

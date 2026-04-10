@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -9,20 +10,48 @@ from agents.tools import refresh_company_data_tool
 from app.config import get_settings
 from app.logging import get_logger
 from graph.workflow import run_analyst_workflow
-from schemas.models import AnalysisBundle, EvidenceBundle, FinalAnswer, ResearchPlan
+from schemas.models import AnalysisBundle, EvidenceBundle, FinalAnswer, OrchestrationPlan, ResearchPlan, RetryDecision
 from storage.bootstrap import bootstrap_storage
 
 
 logger = get_logger(__name__)
 
 
-def _render_collect_section(plan: ResearchPlan, evidence_bundle: EvidenceBundle) -> None:
+def _available_tickers(default_ticker: str) -> list[str]:
+    companies_dir = get_settings().data_dir / "companies"
+    tickers = [default_ticker.upper()]
+    if companies_dir.exists():
+        tickers.extend(path.name.upper() for path in companies_dir.iterdir() if path.is_dir())
+    return sorted(dict.fromkeys(tickers))
+
+
+def _resolve_sidebar_ticker(selected_known_ticker: str, custom_ticker: str) -> str:
+    custom = custom_ticker.strip().upper()
+    return custom or selected_known_ticker.strip().upper()
+
+
+def _render_collect_section(
+    plan: ResearchPlan,
+    orchestration_plan: OrchestrationPlan,
+    evidence_bundle: EvidenceBundle,
+    routing_source: str | None,
+    selected_tools: list[str] | None,
+    requested_sources: list[str] | None,
+    selected_sources: list[str] | None,
+    clarification_needed: bool,
+    clarification_question: str | None,
+    clarification_reason: str | None,
+) -> None:
     # This tab answers "what did the system collect before it started reasoning?"
     # Keeping the collection stage visible is important for the assignment and for debugging:
     # if the final answer looks weak, this section tells us whether the problem started with
     # missing evidence rather than bad analysis or synthesis.
     st.subheader("Collect")
     st.write("The Collector agent decides which evidence to retrieve before any conclusion is written.")
+    if clarification_needed and clarification_question:
+        st.warning(f"Clarification could improve this run: {clarification_question}")
+        if clarification_reason:
+            st.caption(clarification_reason)
     st.markdown("**Research goals**")
     for goal in plan.goals:
         st.write(f"- {goal}")
@@ -30,6 +59,20 @@ def _render_collect_section(plan: ResearchPlan, evidence_bundle: EvidenceBundle)
     st.markdown("**Retrieval notes**")
     for note in evidence_bundle.retrieval_notes:
         st.write(f"- {note}")
+
+    st.markdown("**Orchestration details**")
+    if routing_source:
+        st.write(f"- Planning source: `{routing_source}`")
+    if orchestration_plan.sub_intents:
+        st.write("- Sub-intents: " + ", ".join(f"`{intent}`" for intent in orchestration_plan.sub_intents))
+    if requested_sources:
+        st.write("- Requested sources: " + ", ".join(f"`{source}`" for source in requested_sources))
+    if selected_sources:
+        st.write("- Retrieved sources: " + ", ".join(f"`{source}`" for source in selected_sources))
+    if selected_tools:
+        st.write("- Selected tools: " + ", ".join(f"`{tool}`" for tool in selected_tools))
+    if orchestration_plan.confidence_notes:
+        st.write(f"- Planning note: {orchestration_plan.confidence_notes}")
 
     if evidence_bundle.tool_results:
         tool_rows = [
@@ -63,7 +106,12 @@ def _render_chart(chart_spec: dict[str, Any] | None) -> None:
             st.line_chart(line_df.set_index(x_field), height=320)
 
 
-def _render_explore_section(analysis_bundle: AnalysisBundle, chart_spec: dict[str, Any] | None, chart_artifact_path: str | None) -> None:
+def _render_explore_section(
+    analysis_bundle: AnalysisBundle,
+    retry_decision: RetryDecision,
+    chart_spec: dict[str, Any] | None,
+    chart_artifact_path: str | None,
+) -> None:
     # This tab is the EDA checkpoint. It shows tool-produced findings before the final memo,
     # so we can verify the system actually analyzed the retrieved data instead of jumping
     # straight from raw evidence to a conclusion.
@@ -82,6 +130,18 @@ def _render_explore_section(analysis_bundle: AnalysisBundle, chart_spec: dict[st
         st.markdown("**EDA notes**")
         for note in analysis_bundle.notes:
             st.write(f"- {note}")
+
+    if retry_decision.reason or retry_decision.retry_requested:
+        st.markdown("**Retry decision**")
+        if retry_decision.reason:
+            st.write(f"- Reason: {retry_decision.reason}")
+        st.write(f"- Retry requested: `{retry_decision.retry_requested}`")
+        if retry_decision.missing_modalities:
+            st.write("- Missing modalities: " + ", ".join(f"`{item}`" for item in retry_decision.missing_modalities))
+        if retry_decision.missing_sources:
+            st.write("- Missing sources: " + ", ".join(f"`{item}`" for item in retry_decision.missing_sources))
+        if retry_decision.missing_metrics:
+            st.write("- Missing metrics: " + ", ".join(f"`{item}`" for item in retry_decision.missing_metrics))
 
     _render_chart(chart_spec)
     if chart_artifact_path:
@@ -110,7 +170,6 @@ def _render_hypothesis_section(final_answer: FinalAnswer, memo_artifact_path: st
 
 
 def main() -> None:
-    # `main()` is the easiest starting point for reading the app because it wires together
     # the full top-level user flow:
     # 1. ensure storage exists,
     # 2. render the Streamlit controls,
@@ -128,7 +187,11 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Controls")
-        ticker = st.selectbox("Ticker", [settings.default_ticker], index=0)
+        known_tickers = _available_tickers(settings.default_ticker)
+        selected_known_ticker = st.selectbox("Loaded ticker", known_tickers, index=known_tickers.index(settings.default_ticker.upper()) if settings.default_ticker.upper() in known_tickers else 0)
+        custom_ticker = st.text_input("Or enter a new ticker", value="", placeholder="e.g. MSFT")
+        ticker = _resolve_sidebar_ticker(selected_known_ticker, custom_ticker)
+        st.caption("Use a loaded ticker, or enter a new one and click refresh before running the workflow. SEC filings, CompanyFacts, and market data are generic; press-release coverage is currently strongest for NVIDIA.")
         if st.button("Refresh Company Data", use_container_width=True):
             with st.spinner("Refreshing company data and processing documents..."):
                 refresh_result = refresh_company_data_tool.invoke({"ticker": ticker})
@@ -160,17 +223,35 @@ def main() -> None:
     # through Streamlit session state and LangGraph state. We immediately convert them back
     # into typed Pydantic models here so the UI layer can rely on a stable contract.
     plan = ResearchPlan.model_validate(result["research_plan"])
+    orchestration_plan = OrchestrationPlan.model_validate(result["orchestration_plan"])
     evidence_bundle = EvidenceBundle.model_validate(result["evidence_bundle"])
     analysis_bundle = AnalysisBundle.model_validate(result["analysis_bundle"])
+    retry_decision = RetryDecision.model_validate(result.get("retry_decision") or {})
     final_answer = FinalAnswer.model_validate(result["final_answer"])
 
     collect_tab, explore_tab, hypothesis_tab, debug_tab = st.tabs(["Collect", "Explore / Analyze", "Hypothesis", "Debug"])
 
     with collect_tab:
-        _render_collect_section(plan, evidence_bundle)
+        _render_collect_section(
+            plan,
+            orchestration_plan,
+            evidence_bundle,
+            result.get("routing_source"),
+            result.get("selected_tools"),
+            result.get("requested_sources"),
+            result.get("selected_sources"),
+            bool(result.get("clarification_needed")),
+            result.get("clarification_question"),
+            result.get("clarification_reason"),
+        )
 
     with explore_tab:
-        _render_explore_section(analysis_bundle, result.get("chart_spec"), result.get("chart_artifact_path"))
+        _render_explore_section(
+            analysis_bundle,
+            retry_decision,
+            result.get("chart_spec"),
+            result.get("chart_artifact_path"),
+        )
 
     with hypothesis_tab:
         _render_hypothesis_section(final_answer, result.get("memo_artifact_path"))

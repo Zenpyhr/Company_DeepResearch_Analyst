@@ -13,7 +13,8 @@ from schemas.models import Company, Source
 
 logger = get_logger(__name__)
 
-# MVP approach: use NVIDIA's newsroom listing page and collect a small set of recent article links.
+# MVP approach: NVIDIA has a stable newsroom we can scrape directly.
+# Other companies may not, so press-release collection falls back to SEC + market + CompanyFacts only.
 NVIDIA_NEWSROOM_URL = "https://nvidianews.nvidia.com/news"
 
 
@@ -24,6 +25,10 @@ def _press_release_dir(ticker: str) -> Path:
 
 
 def fetch_press_releases(company: Company, limit: int = 5) -> list[Source]:
+    if company.ticker != "NVDA":
+        logger.info("Skipping press release fetch for %s because only NVIDIA has a configured newsroom collector.", company.ticker)
+        return []
+
     logger.info("Fetching press release listing for %s", company.ticker)
     response = requests.get(NVIDIA_NEWSROOM_URL, timeout=30)
     response.raise_for_status()
