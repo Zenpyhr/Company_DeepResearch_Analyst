@@ -10,6 +10,7 @@ COPY pyproject.toml README.md /app/
 COPY app /app/app
 COPY agents /app/agents
 COPY graph /app/graph
+COPY mcp_server /app/mcp_server
 COPY pipelines /app/pipelines
 COPY prompts /app/prompts
 COPY schemas /app/schemas
