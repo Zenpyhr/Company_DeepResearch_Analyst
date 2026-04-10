@@ -178,8 +178,8 @@ def main() -> None:
     # 5. render Collect -> Explore/Analyze -> Hypothesis tabs.
     bootstrap_storage()
     settings = get_settings()
-    st.set_page_config(page_title="NVDA Analyst Agent", layout="wide")
-    st.title("NVDA Analyst Agent")
+    st.set_page_config(page_title="Company Analyst Agent", layout="wide")
+    st.title("Company Analyst Agent")
     st.caption("Single-company analyst workflow with explicit Collect -> Explore -> Hypothesize stages.")
 
     if "workflow_result" not in st.session_state:
