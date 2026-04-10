@@ -1,6 +1,11 @@
-# NVDA Analyst Agent
+# Project 2: Company Data Analyst Agent
 
-Single-company deep research analyst agent for `NVDA` with explicit `Collect -> Explore / Analyze -> Hypothesize` stages.
+Company data analyst agent with explicit `Collect -> Explore / Analyze -> Hypothesize` stages.
+
+## Live App
+
+- Public URL:
+  - `https://project2-company-data-analyst-agent-555207000332.us-central1.run.app`
 
 ## What This App Does
 
@@ -148,7 +153,9 @@ The `Analyst Agent` synthesizes the evidence and EDA findings into a grounded an
 - `Multi-agent pattern`
   - `Collector -> EDA -> Analyst` in [graph/workflow.py](./graph/workflow.py)
 - `Deployed`
-  - Docker + Cloud Build + Cloud Run scaffolding:
+  - live Cloud Run app:
+    - `https://project2-company-data-analyst-agent-555207000332.us-central1.run.app`
+  - deployment files:
     - [Dockerfile](./Dockerfile)
     - [cloudbuild.yaml](./cloudbuild.yaml)
 - `README`
@@ -241,6 +248,7 @@ The hosted target is Google Cloud.
 
 ## Notes
 
-- `NVDA` is the only supported company in v1.
+- The strongest fully supported path is still `NVDA`.
+- New tickers can now be refreshed through SEC filings, SEC CompanyFacts, and market data.
+- Press-release collection is currently company-specific and strongest for `NVDA`.
 - Event extraction is intentionally deferred until the core analyst loop is stable.
-- A live deployed URL should be added here after Cloud Run deployment is completed.
