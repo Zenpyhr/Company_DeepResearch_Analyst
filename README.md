@@ -5,7 +5,7 @@ Company data analyst agent with explicit `Collect -> Explore / Analyze -> Hypoth
 ## Live App
 
 - Public URL:
-  - `https://project2-company-data-analyst-agent-555207000332.us-central1.run.app`
+  - `https://company-deepresearch-analyst-git-555207000332.us-central1.run.app`
 
 ## What This App Does
 

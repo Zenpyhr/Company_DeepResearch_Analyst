@@ -178,8 +178,8 @@ def main() -> None:
     # 5. render Collect -> Explore/Analyze -> Hypothesis tabs.
     bootstrap_storage()
     settings = get_settings()
-    st.set_page_config(page_title="Project 2: Company Data Analyst Agent", layout="wide")
-    st.title("Project 2: Company Data Analyst Agent")
+    st.set_page_config(page_title="Company Data Analyst Agent", layout="wide")
+    st.title("Company Data Analyst Agent")
     st.caption("Company analyst workflow with explicit Collect -> Explore -> Hypothesize stages.")
 
     if "workflow_result" not in st.session_state:
