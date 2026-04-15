@@ -684,6 +684,84 @@ def _build_fallback_answer_text(question: str, key_points: list[str], support_sn
     return "\n".join(answer_parts)
 
 
+def _format_sql_answer_value(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, float):
+        if value.is_integer():
+            return f"{int(value):,}"
+        return f"{value:,.2f}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return str(value)
+
+
+def _should_use_sql_direct_answer(question: str, findings: list[dict[str, Any]]) -> bool:
+    if not findings or findings[0].get("finding_type") != "sql_analysis":
+        return False
+    lowered = question.lower()
+    direct_patterns = ["how many", "count", "breakdown", "distribution", "average", "avg"]
+    return any(pattern in lowered for pattern in direct_patterns)
+
+
+def _build_sql_direct_answer(ticker: str, finding: dict[str, Any]) -> tuple[str, list[str]]:
+    rows = list(finding.get("supporting_records", []) or [])
+    metrics = finding.get("metrics", {}) or {}
+    tables_used = metrics.get("tables_used", []) or []
+
+    if not rows:
+        table_text = ", ".join(str(table) for table in tables_used) if tables_used else "the requested table"
+        return (
+            f"The SQL analysis for {ticker} ran successfully against {table_text} but returned no rows.",
+            ["SQL analysis returned no rows for the requested question."],
+        )
+
+    first_row = rows[0]
+    count_key = next((key for key in ["record_count", "source_count", "count"] if key in first_row), None)
+    if count_key:
+        label_key = next(
+            (
+                key
+                for key, value in first_row.items()
+                if key != count_key and value is not None and not isinstance(value, (int, float))
+            ),
+            None,
+        )
+        if label_key:
+            fragments = [
+                f"{_format_sql_answer_value(row.get(count_key))} `{row.get(label_key)}` record{'s' if row.get(count_key) != 1 else ''}"
+                for row in rows[:5]
+            ]
+            answer_text = f"For {ticker}, the dataset currently contains " + ", ".join(fragments) + "."
+            key_points = [
+                f"{row.get(label_key)}: {_format_sql_answer_value(row.get(count_key))} record{'s' if row.get(count_key) != 1 else ''}"
+                for row in rows[:3]
+            ]
+            return answer_text, key_points
+
+    if "average_close" in first_row:
+        average_close = _format_sql_answer_value(first_row.get("average_close"))
+        window_start = first_row.get("window_start")
+        window_end = first_row.get("window_end")
+        answer_parts = [f"For {ticker}, the average closing price in the available market data is {average_close}."]
+        if window_start and window_end:
+            answer_parts.append(f"The current window spans {window_start} through {window_end}.")
+        key_points = [f"Average close: {average_close}"]
+        if window_start and window_end:
+            key_points.append(f"Window: {window_start} to {window_end}")
+        return " ".join(answer_parts), key_points
+
+    preview_rows = []
+    for row in rows[:3]:
+        preview = ", ".join(f"{key}={_format_sql_answer_value(value)}" for key, value in list(row.items())[:3])
+        preview_rows.append(preview)
+    answer_text = f"The SQL analysis for {ticker} returned {len(rows)} row(s). " + " Sample results: " + "; ".join(preview_rows) + "."
+    key_points = [f"Rows returned: {len(rows)}"]
+    if tables_used:
+        key_points.append(f"Tables used: {', '.join(str(table) for table in tables_used)}")
+    return answer_text, key_points
+
+
 def final_answer_builder(
     *,
     ticker: str,
@@ -735,7 +813,9 @@ def final_answer_builder(
         key_points = [point for point in key_points if point != str(text_finding.get("summary") if text_finding else "")]
         key_points.insert(1 if key_points else 0, mixed_narrative_point)
 
-    if llm_summary:
+    if _should_use_sql_direct_answer(question, ranked_findings):
+        answer_text, key_points = _build_sql_direct_answer(ticker, ranked_findings[0])
+    elif llm_summary:
         answer_text = llm_summary.strip()
     else:
         answer_text = _build_fallback_answer_text(question, key_points, support_snippets)

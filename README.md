@@ -24,7 +24,15 @@ Company analyst agent with an explicit `Collect -> Explore -> Hypothesize` workf
   - collect evidence
   - run tool-based EDA
   - produce a grounded final answer with sources
+- Applies deterministic constraint handling for explicit user instructions such as:
+  - `only use press releases`
+  - `don't use filings`
+  - `not revenue, focus on cash`
 - Includes an out-of-scope guardrail for unrelated requests such as weather, recipes, creative writing, sports, and general coding tasks
+- Uses a hybrid scope guardrail:
+  - fast deterministic rejection for obvious unrelated prompts
+  - LLM scope classification for ambiguous off-topic prompts
+- Returns a safe fallback response instead of crashing if a backend workflow step fails unexpectedly
 - Generates artifacts such as:
   - CSVs
   - chart specs
@@ -120,6 +128,7 @@ Examples of EDA behavior:
 - `market_reaction_tool` computes total return and volatility over the retrieved market window.
 - `text_theme_tool` counts repeated themes and source-specific patterns in filings and press releases.
 - `sql_query_tool` generates safe read-only SQL for count / breakdown / distribution / average style questions and returns rows as a finding.
+- For structured source-count / metadata questions, the workflow can narrow the run to a SQL-only path in [graph/workflow.py](./graph/workflow.py) `_apply_sql_only_focus`.
 
 The Explore tab in [streamlit_app.py](./streamlit_app.py) shows the EDA findings first and keeps raw payloads behind expanders so the analysis remains auditable without overwhelming the UI.
 
@@ -136,6 +145,7 @@ How the hypothesis is grounded:
 
 - The analyst node passes the evidence bundle and analysis bundle into `final_answer_builder`.
 - `final_answer_builder` ranks findings, selects key points, gathers source URLs, and writes the final memo artifact.
+- For narrow SQL-style questions such as counts, breakdowns, and averages, `final_answer_builder` switches to a direct factual answer mode instead of a longer memo-style response.
 - The frontend displays:
   - answer
   - key points
@@ -275,12 +285,16 @@ The project implements more than two elective concepts.
 
 - `Planner fallback`
   - If LLM planning fails, the workflow uses heuristic planning in [graph/workflow.py](./graph/workflow.py)
+- `Constraint fallback`
+  - Explicit negation / exclusion instructions are enforced deterministically in [graph/workflow.py](./graph/workflow.py) `_apply_negation_constraints`, even when the planner falls back to heuristics
 - `LLM answer fallback`
   - If the LLM is unavailable, the app falls back to deterministic planning and answer construction through [agents/llm.py](./agents/llm.py) and [agents/tools.py](./agents/tools.py) `final_answer_builder`
 - `Refresh fallback`
   - If retrieval returns no evidence, the collector tries `refresh_company_data_tool` once
 - `SQL fallback`
   - If LLM SQL generation is unavailable, `sql_query_tool` falls back to a heuristic SQL path
+- `Safe workflow fallback`
+  - If an unexpected backend exception escapes the workflow, [graph/workflow.py](./graph/workflow.py) `run_analyst_workflow` returns a structured fallback result instead of crashing the app
 
 ### Out-of-Scope Handling
 
@@ -289,6 +303,7 @@ The current system **does** have an out-of-scope guardrail.
 What it does today:
 
 - The planner checks for clearly unrelated requests in [graph/workflow.py](./graph/workflow.py) `_detect_out_of_scope`.
+- If the keyword layer is inconclusive, the planner can run an LLM scope check in [graph/workflow.py](./graph/workflow.py) `_llm_scope_check` before any collection starts.
 - If the question is outside the company-analysis domain, the workflow short-circuits before collection and EDA.
 - The final answer explains the supported scope and suggests better in-domain question types.
 - For broad but still in-domain questions, the planner can surface a clarification suggestion in [graph/workflow.py](./graph/workflow.py) `_detect_clarification_need`.

@@ -324,6 +324,60 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertIn("outside the current app scope", result["final_answer"]["answer"])
         self.assertIn("analyst:out_of_scope", result["execution_log"])
 
+    def test_llm_scope_check_can_mark_ambiguous_question_out_of_scope(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        with patch.object(graph_workflow, "_detect_out_of_scope", return_value=(False, None)):
+            with patch.object(graph_workflow, "_should_use_llm_scope_check", return_value=True):
+                with patch.object(
+                    graph_workflow,
+                    "_llm_scope_check",
+                    return_value=(True, "This question is unrelated to the company-analysis dataset."),
+                ):
+                    result = graph_workflow._planner_node(
+                        {"question": "Should I study P/E ratios or memorize formulas?", "company_ticker": "NVDA"}
+                    )  # type: ignore[attr-defined]
+        self.assertTrue(result["out_of_scope"])
+        self.assertIn("planner:scope_check:llm_scope", result["execution_log"])
+
+    def test_sql_breakdown_question_gets_direct_factual_answer(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        result = graph_workflow.run_analyst_workflow(
+            "How many source records do we have by source type for NVIDIA?",
+            company_ticker="NVDA",
+        )
+        self.assertIn("dataset currently contains", result["final_answer"]["answer"])
+        self.assertIn("sec_filing", result["final_answer"]["answer"])
+        self.assertNotIn("typical data coverage", result["final_answer"]["answer"])
+
+    def test_negation_constraints_can_limit_sources(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        result = graph_workflow._planner_node(  # type: ignore[attr-defined]
+            {"question": "Don't use filings, only use press releases to analyze NVIDIA risks.", "company_ticker": "NVDA"}
+        )
+        self.assertEqual(["press_release"], result["orchestration_plan"]["retrieval_plan"]["source_types"])
+        self.assertEqual("qualitative", result["orchestration_plan"]["question_type"])
+        self.assertNotIn("financial_trend_tool", result["selected_tools"])
+
+    def test_negation_constraints_can_shift_metric_focus(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        result = graph_workflow._planner_node(  # type: ignore[attr-defined]
+            {"question": "Not revenue; focus on cash for NVIDIA.", "company_ticker": "NVDA"}
+        )
+        metric_names = result["orchestration_plan"]["retrieval_plan"]["metric_names"]
+        self.assertIn("cash_and_cash_equivalents", metric_names)
+        self.assertNotIn("revenue", metric_names)
+
+    def test_workflow_failure_returns_safe_fallback_result(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        with patch.object(graph_workflow.WORKFLOW, "invoke", side_effect=RuntimeError("forced workflow failure")):
+            result = graph_workflow.run_analyst_workflow(
+                "How has NVIDIA revenue changed over recent reported periods?",
+                company_ticker="NVDA",
+            )
+        self.assertIn("backend step failed", result["final_answer"]["answer"])
+        self.assertEqual([], result["selected_tools"])
+        self.assertTrue(any(entry.startswith("workflow:error:") for entry in result["execution_log"]))
+
     def test_mixed_answer_includes_source_aware_narrative_point(self) -> None:
         graph_workflow = importlib.import_module("graph.workflow")
         result = graph_workflow.run_analyst_workflow(

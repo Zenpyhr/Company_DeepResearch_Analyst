@@ -47,6 +47,14 @@ logger = get_logger(__name__)
 
 ALLOWED_SOURCE_TYPES = {"sec_filing", "press_release"}
 ALLOWED_EDA_TOOLS = {"financial_trend_tool", "market_reaction_tool", "text_theme_tool", "chart_tool", "sql_query_tool"}
+METRIC_ALIAS_MAP: dict[str, list[str]] = {
+    "revenue": ["revenue", "sales", "top line"],
+    "net_income": ["net income", "profit", "bottom line", "earnings"],
+    "gross_profit": ["gross profit", "gross margin"],
+    "eps_diluted": ["eps", "earnings per share"],
+    "research_and_development": ["research", "r&d", "development"],
+    "cash_and_cash_equivalents": ["cash", "liquidity"],
+}
 
 
 class AgentState(TypedDict, total=False):
@@ -78,6 +86,82 @@ class AgentState(TypedDict, total=False):
 
 
 LLM = OptionalLLM()
+
+ANALYSIS_TERMS = {
+    "revenue",
+    "income",
+    "profit",
+    "eps",
+    "cash",
+    "margin",
+    "quarter",
+    "quarters",
+    "financial",
+    "growth",
+    "stock",
+    "price",
+    "market",
+    "volume",
+    "return",
+    "reaction",
+    "risk",
+    "risks",
+    "filing",
+    "filings",
+    "press",
+    "release",
+    "releases",
+    "source",
+    "sources",
+    "dataset",
+    "records",
+    "count",
+    "breakdown",
+    "distribution",
+    "average",
+    "company",
+}
+OFF_DOMAIN_TERMS = {
+    "weather",
+    "temperature",
+    "forecast",
+    "recipe",
+    "cook",
+    "poem",
+    "joke",
+    "story",
+    "translate",
+    "translation",
+    "capital",
+    "president",
+    "movie",
+    "music",
+    "song",
+    "travel",
+    "hotel",
+    "flight",
+    "restaurant",
+    "sports",
+    "nba",
+    "nfl",
+    "soccer",
+    "baseball",
+    "program",
+    "code",
+    "coding",
+    "debug",
+    "bug",
+    "algorithm",
+    "math",
+    "algebra",
+    "calculus",
+    "eat",
+    "dinner",
+    "lunch",
+    "breakfast",
+    "food",
+    "meal",
+}
 
 
 def _contains_term(lowered: str, tokens: set[str], terms: set[str]) -> bool:
@@ -114,15 +198,7 @@ def _classify_question(question: str) -> tuple[str, str]:
 
 def _metric_names_for_question(question: str) -> list[str]:
     lowered = question.lower()
-    candidates = {
-        "revenue": ["revenue", "sales", "top line"],
-        "net_income": ["income", "net income", "profit", "bottom line"],
-        "gross_profit": ["gross profit", "gross margin"],
-        "eps_diluted": ["eps", "earnings per share"],
-        "research_and_development": ["research", "r&d", "development"],
-        "cash_and_cash_equivalents": ["cash", "liquidity"],
-    }
-    selected = [metric for metric, aliases in candidates.items() if any(alias in lowered for alias in aliases)]
+    selected = [metric for metric, aliases in METRIC_ALIAS_MAP.items() if any(alias in lowered for alias in aliases)]
     return selected or ["revenue", "net_income", "gross_profit", "eps_diluted"]
 
 
@@ -207,85 +283,53 @@ def _detect_out_of_scope(question: str, ticker: str) -> tuple[bool, str | None]:
     if not lowered:
         return False, None
 
-    analysis_terms = {
-        "revenue",
-        "income",
-        "profit",
-        "eps",
-        "cash",
-        "margin",
-        "quarter",
-        "quarters",
-        "financial",
-        "growth",
-        "stock",
-        "price",
-        "market",
-        "volume",
-        "return",
-        "reaction",
-        "risk",
-        "risks",
-        "filing",
-        "filings",
-        "press",
-        "release",
-        "releases",
-        "source",
-        "sources",
-        "dataset",
-        "records",
-        "count",
-        "breakdown",
-        "distribution",
-        "average",
-        "company",
-        ticker.lower(),
-    }
-    off_domain_terms = {
-        "weather",
-        "temperature",
-        "forecast",
-        "recipe",
-        "cook",
-        "poem",
-        "joke",
-        "story",
-        "translate",
-        "translation",
-        "capital",
-        "president",
-        "movie",
-        "music",
-        "song",
-        "travel",
-        "hotel",
-        "flight",
-        "restaurant",
-        "sports",
-        "nba",
-        "nfl",
-        "soccer",
-        "baseball",
-        "program",
-        "code",
-        "coding",
-        "debug",
-        "bug",
-        "algorithm",
-        "math",
-        "algebra",
-        "calculus",
-    }
-
-    has_analysis_signal = any(term in lowered for term in analysis_terms)
-    matched_off_domain = sorted(term for term in off_domain_terms if term in lowered)
+    has_analysis_signal = _has_analysis_signal(question, ticker)
+    matched_off_domain = sorted(term for term in OFF_DOMAIN_TERMS if term in lowered)
     if matched_off_domain and not has_analysis_signal:
         return (
             True,
             "This app is scoped to company-analysis questions over filings, financial metrics, market data, press releases, and source metadata."
         )
     return False, None
+
+
+def _has_analysis_signal(question: str, ticker: str) -> bool:
+    lowered = question.lower().strip()
+    return any(term in lowered for term in {ticker.lower(), *ANALYSIS_TERMS})
+
+
+def _should_use_llm_scope_check(question: str, ticker: str) -> bool:
+    lowered = question.lower().strip()
+    if not lowered or _has_analysis_signal(question, ticker):
+        return False
+    if any(term in lowered for term in OFF_DOMAIN_TERMS):
+        return False
+    return True
+
+
+def _llm_scope_check(question: str, ticker: str) -> tuple[bool, str | None] | None:
+    if not LLM.available:
+        return None
+
+    prompt = (
+        f"Question: {question}\n"
+        f"Ticker: {ticker}\n"
+        "This app only supports company-analysis questions over filings, financial metrics, market data, press releases, and source metadata.\n"
+        "Return JSON only with keys: decision, reason.\n"
+        "decision must be one of: in_scope, out_of_scope.\n"
+        "Mark out_of_scope if the user is asking for general life advice, food, weather, creative writing, sports, coding help, or anything unrelated to analyzing the selected company's dataset.\n"
+        "Be conservative: if the question does not ask about the company, its evidence, or its dataset, mark it out_of_scope."
+    )
+    payload = LLM.complete_json(system_prompt=ORCHESTRATOR_SYSTEM_PROMPT, user_prompt=prompt, max_tokens=120)
+    if not payload:
+        return None
+    decision = str(payload.get("decision", "")).strip().lower()
+    reason = str(payload.get("reason", "")).strip() or None
+    if decision == "out_of_scope":
+        return True, reason or "This question does not ask about the supported company-analysis dataset."
+    if decision == "in_scope":
+        return False, reason
+    return None
 
 
 def _needs_sql_analysis(question: str) -> bool:
@@ -302,6 +346,182 @@ def _needs_sql_analysis(question: str) -> bool:
         "grouped by",
     ]
     return any(pattern in lowered for pattern in sql_patterns)
+
+
+def _needs_sql_only_path(question: str) -> bool:
+    lowered = question.lower()
+    metadata_terms = ["source record", "source records", "source type", "source types", "dataset", "metadata"]
+    return _needs_sql_analysis(question) and any(term in lowered for term in metadata_terms)
+
+
+def _derive_plan_shape(retrieval_plan: RetrievalPlan) -> tuple[str, str, list[str]]:
+    has_qualitative = retrieval_plan.needs_qualitative and bool(retrieval_plan.source_types)
+    has_financial = retrieval_plan.needs_quantitative and bool(retrieval_plan.metric_names)
+    has_market = retrieval_plan.needs_market_data
+
+    if has_qualitative and (has_financial or has_market):
+        sub_intents = ["financial_trend", "risk_narrative"]
+        if has_market:
+            sub_intents.append("market_reaction")
+        return "mixed", "mixed", sub_intents
+    if has_market:
+        return "market_reaction", "quantitative", ["market_reaction"]
+    if has_qualitative:
+        return "risk_narrative", "qualitative", ["risk_narrative"]
+    return "financial_trend", "quantitative", ["financial_trend"]
+
+
+def _negation_constraints(question: str) -> dict[str, Any]:
+    lowered = question.lower()
+    exclusive_sources: set[str] = set()
+    excluded_sources: set[str] = set()
+    included_metrics: set[str] = set()
+    excluded_metrics: set[str] = set()
+
+    source_aliases = {
+        "sec_filing": ["filing", "filings", "sec filing", "sec filings"],
+        "press_release": ["press release", "press releases"],
+    }
+    def _has_any_pattern(alias: str, patterns: list[str]) -> bool:
+        return any(pattern.format(alias=alias) in lowered for pattern in patterns)
+
+    for source_type, aliases in source_aliases.items():
+        for alias in aliases:
+            if _has_any_pattern(alias, ["only use {alias}", "use only {alias}", "just use {alias}", "only {alias}"]):
+                exclusive_sources.add(source_type)
+            if _has_any_pattern(alias, ["don't use {alias}", "do not use {alias}", "exclude {alias}", "without {alias}", "no {alias}"]):
+                excluded_sources.add(source_type)
+
+    for metric_name, aliases in METRIC_ALIAS_MAP.items():
+        for alias in aliases:
+            if _has_any_pattern(alias, ["only use {alias}", "use only {alias}", "just use {alias}", "focus on {alias}", "only {alias}", "just {alias}"]):
+                included_metrics.add(metric_name)
+            if _has_any_pattern(alias, ["don't use {alias}", "do not use {alias}", "exclude {alias}", "without {alias}", "not {alias}", "no {alias}"]):
+                excluded_metrics.add(metric_name)
+
+    exclude_market_data = any(
+        phrase in lowered
+        for phrase in [
+            "don't use market data",
+            "do not use market data",
+            "exclude market data",
+            "without market data",
+            "no market data",
+            "not market data",
+            "not stock price",
+            "not stock prices",
+            "don't use stock price",
+            "do not use stock price",
+        ]
+    )
+    return {
+        "exclusive_sources": sorted(exclusive_sources),
+        "excluded_sources": sorted(excluded_sources),
+        "included_metrics": sorted(included_metrics),
+        "excluded_metrics": sorted(excluded_metrics),
+        "exclude_market_data": exclude_market_data,
+    }
+
+
+def _apply_negation_constraints(question: str, plan: OrchestrationPlan) -> OrchestrationPlan:
+    constraints = _negation_constraints(question)
+    retrieval_plan = plan.retrieval_plan.model_copy(deep=True)
+    eda_plan = plan.eda_plan.model_copy(deep=True)
+    notes = list(plan.notes)
+    constraint_notes: list[str] = []
+
+    exclusive_sources = constraints["exclusive_sources"]
+    excluded_sources = constraints["excluded_sources"]
+    included_metrics = constraints["included_metrics"]
+    excluded_metrics = constraints["excluded_metrics"]
+    exclude_market_data = constraints["exclude_market_data"]
+
+    if exclusive_sources:
+        retrieval_plan.needs_qualitative = True
+        retrieval_plan.source_types = [source for source in ["sec_filing", "press_release"] if source in exclusive_sources]
+        retrieval_plan.needs_quantitative = False
+        retrieval_plan.metric_names = []
+        retrieval_plan.needs_market_data = False
+        constraint_notes.append(f"Source constraint applied: only use {', '.join(exclusive_sources)} evidence.")
+
+    if excluded_sources:
+        retrieval_plan.source_types = [source for source in retrieval_plan.source_types if source not in excluded_sources]
+        constraint_notes.append(f"Source constraint applied: exclude {', '.join(excluded_sources)} evidence.")
+
+    if included_metrics:
+        retrieval_plan.needs_quantitative = True
+        retrieval_plan.metric_names = [metric for metric in METRIC_ALIAS_MAP if metric in included_metrics]
+        constraint_notes.append(f"Metric constraint applied: prioritize {', '.join(retrieval_plan.metric_names)}.")
+
+    if excluded_metrics:
+        retrieval_plan.metric_names = [metric for metric in retrieval_plan.metric_names if metric not in excluded_metrics]
+        if retrieval_plan.metric_names:
+            constraint_notes.append(f"Metric constraint applied: exclude {', '.join(excluded_metrics)}.")
+
+    if exclude_market_data:
+        retrieval_plan.needs_market_data = False
+        constraint_notes.append("Market-data constraint applied: exclude market data and stock-price analysis.")
+
+    if not retrieval_plan.source_types:
+        retrieval_plan.needs_qualitative = False
+    if not retrieval_plan.metric_names and not retrieval_plan.needs_market_data:
+        retrieval_plan.needs_quantitative = False
+
+    selected_tools = [tool for tool in eda_plan.selected_tools if tool in ALLOWED_EDA_TOOLS]
+    if not retrieval_plan.needs_qualitative:
+        selected_tools = [tool for tool in selected_tools if tool != "text_theme_tool"]
+    elif "text_theme_tool" not in selected_tools and retrieval_plan.source_types:
+        selected_tools.append("text_theme_tool")
+
+    if not retrieval_plan.needs_quantitative:
+        selected_tools = [tool for tool in selected_tools if tool != "financial_trend_tool"]
+    if not retrieval_plan.needs_market_data:
+        selected_tools = [tool for tool in selected_tools if tool != "market_reaction_tool"]
+    if "chart_tool" in selected_tools and not any(tool in selected_tools for tool in ["financial_trend_tool", "market_reaction_tool"]):
+        selected_tools = [tool for tool in selected_tools if tool != "chart_tool"]
+    eda_plan = eda_plan.model_copy(update={"selected_tools": selected_tools})
+
+    if constraint_notes:
+        question_category, question_type, sub_intents = _derive_plan_shape(retrieval_plan)
+        return plan.model_copy(
+            update={
+                "question_category": question_category,
+                "question_type": question_type,
+                "sub_intents": sub_intents,
+                "retrieval_plan": retrieval_plan,
+                "eda_plan": eda_plan,
+                "notes": [*notes, *constraint_notes],
+            }
+        )
+    return plan
+
+
+def _apply_sql_only_focus(question: str, plan: OrchestrationPlan) -> OrchestrationPlan:
+    if not _needs_sql_only_path(question):
+        return plan
+    return plan.model_copy(
+        update={
+            "question_type": "quantitative",
+            "question_category": "financial_trend",
+            "sub_intents": ["financial_trend"],
+            "retrieval_plan": RetrievalPlan(
+                needs_qualitative=False,
+                needs_quantitative=False,
+                source_types=[],
+                metric_names=[],
+                limit_per_metric=1,
+                needs_market_data=False,
+                anchor_date_count=1,
+                market_window_days=1,
+            ),
+            "eda_plan": EDAPlan(
+                selected_tools=["sql_query_tool"],
+                chart_metric=None,
+                notes=["SQL-only metadata path selected for a structured source-coverage question."],
+            ),
+            "notes": [*plan.notes, "Planner narrowed this question to the SQL-only metadata path."],
+        }
+    )
 
 
 def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -534,12 +754,21 @@ def _planner_node(state: AgentState) -> AgentState:
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
     out_of_scope, out_of_scope_reason = _detect_out_of_scope(question, ticker)
+    scope_checked_by = "deterministic"
+    if not out_of_scope and _should_use_llm_scope_check(question, ticker):
+        llm_scope_result = _llm_scope_check(question, ticker)
+        if llm_scope_result is not None:
+            out_of_scope, llm_reason = llm_scope_result
+            out_of_scope_reason = llm_reason if out_of_scope else out_of_scope_reason
+            scope_checked_by = "llm_scope"
     clarification_needed, clarification_question, clarification_reason = _detect_clarification_need(question)
     if out_of_scope:
         orchestration_plan = _out_of_scope_orchestration_plan(question, ticker, out_of_scope_reason)
     else:
         heuristic_plan = _heuristic_orchestration_plan(question, ticker)
         orchestration_plan = _llm_orchestration_plan(question, ticker, heuristic_plan) or heuristic_plan
+        orchestration_plan = _apply_negation_constraints(question, orchestration_plan)
+        orchestration_plan = _apply_sql_only_focus(question, orchestration_plan)
     if clarification_needed and clarification_reason:
         orchestration_plan = orchestration_plan.model_copy(
             update={
@@ -572,7 +801,11 @@ def _planner_node(state: AgentState) -> AgentState:
         "clarification_reason": clarification_reason,
         "out_of_scope": out_of_scope,
         "out_of_scope_reason": out_of_scope_reason,
-        "execution_log": [*state.get("execution_log", []), f"planner:{'out_of_scope' if out_of_scope else routing_source}"],
+        "execution_log": [
+            *state.get("execution_log", []),
+            f"planner:{'out_of_scope' if out_of_scope else routing_source}",
+            f"planner:scope_check:{scope_checked_by}",
+        ],
     }
 
 
@@ -619,6 +852,29 @@ def _collector_node(state: AgentState) -> AgentState:
     ticker = state.get("company_ticker") or get_settings().default_ticker
     plan = OrchestrationPlan.model_validate(state["orchestration_plan"])
     retrieval_plan = plan.retrieval_plan
+    if (
+        not retrieval_plan.needs_qualitative
+        and not retrieval_plan.needs_quantitative
+        and not retrieval_plan.needs_market_data
+        and plan.eda_plan.selected_tools == ["sql_query_tool"]
+    ):
+        evidence_bundle = EvidenceBundle(
+            company_ticker=ticker,
+            question=question,
+            qualitative_records=[],
+            quantitative_records=[],
+            retrieval_notes=["Collector skipped retrieval because the planner selected the SQL-only metadata path."],
+            tool_results=[],
+        )
+        return {
+            "company_ticker": ticker,
+            "evidence_bundle": evidence_bundle.model_dump(),
+            "loop_count": state.get("loop_count", 0),
+            "retry_requested": False,
+            "execution_log": [*state.get("execution_log", []), "collector:sql_only_skip"],
+            "requested_sources": [],
+            "selected_sources": [],
+        }
     evidence_bundle = EvidenceBundle.model_validate(
         state.get("evidence_bundle")
         or {
@@ -1123,6 +1379,100 @@ class _FallbackWorkflow:
         return state
 
 
+def _build_failure_result(question: str, ticker: str, error_message: str) -> dict[str, Any]:
+    safe_error = (error_message or "Unknown backend error").strip()
+    orchestration_plan = OrchestrationPlan(
+        company_ticker=ticker,
+        question=question,
+        question_type="mixed",
+        question_category="mixed",
+        sub_intents=["financial_trend", "risk_narrative"],
+        retrieval_plan=RetrievalPlan(
+            needs_qualitative=False,
+            needs_quantitative=False,
+            source_types=[],
+            metric_names=[],
+            limit_per_metric=1,
+            needs_market_data=False,
+            anchor_date_count=1,
+            market_window_days=1,
+        ),
+        eda_plan=EDAPlan(selected_tools=[], chart_metric=None, notes=[]),
+        retry_policy={"allow_retry": False, "max_retries": 0},
+        notes=["Workflow fell back to a safe error response before a grounded answer could be completed."],
+        confidence_notes="Safe failure fallback activated.",
+        planning_source="heuristic",
+    )
+    research_plan = ResearchPlan(
+        company_ticker=ticker,
+        question=question,
+        question_type="mixed",
+        question_category="mixed",
+        sub_intents=[],
+        goals=["Return a safe fallback response because a backend dependency failed."],
+        tools_to_call=[],
+        notes="The workflow encountered an internal error and returned a safe fallback answer instead of crashing.",
+    )
+    evidence_bundle = EvidenceBundle(
+        company_ticker=ticker,
+        question=question,
+        qualitative_records=[],
+        quantitative_records=[],
+        retrieval_notes=[f"Workflow error: {safe_error}"],
+        tool_results=[],
+    )
+    analysis_bundle = AnalysisBundle(
+        company_ticker=ticker,
+        question=question,
+        findings=[],
+        notes=["No EDA findings were produced because the workflow ended in a safe error fallback."],
+        requires_additional_research=False,
+        missing_modalities=[],
+    )
+    final_answer = FinalAnswer(
+        company_ticker=ticker,
+        question=question,
+        answer=(
+            "The analysis could not complete because a backend step failed. "
+            "The app returned a safe fallback response instead of crashing. "
+            "Please retry, refresh the company data, or ask a narrower question."
+        ),
+        key_points=[
+            "No grounded answer was produced because the workflow stopped early.",
+            "The system returned a safe fallback response instead of surfacing an internal failure.",
+        ],
+        sources=[],
+        confidence_note="Safe error fallback activated before a grounded answer could be completed.",
+    )
+    return {
+        "question": question,
+        "company_ticker": ticker,
+        "orchestration_plan": orchestration_plan.model_dump(),
+        "research_plan": research_plan.model_dump(),
+        "evidence_bundle": evidence_bundle.model_dump(),
+        "analysis_bundle": analysis_bundle.model_dump(),
+        "retry_decision": RetryDecision(retry_requested=False).model_dump(),
+        "final_answer": final_answer.model_dump(),
+        "chart_spec": None,
+        "chart_artifact_path": None,
+        "memo_artifact_path": None,
+        "loop_count": 0,
+        "refresh_attempted": False,
+        "retry_requested": False,
+        "routing_source": "heuristic_fallback",
+        "selected_tools": [],
+        "requested_sources": [],
+        "selected_sources": [],
+        "retry_reason": safe_error,
+        "clarification_needed": False,
+        "clarification_question": None,
+        "clarification_reason": None,
+        "out_of_scope": False,
+        "out_of_scope_reason": None,
+        "execution_log": [f"workflow:error:{safe_error}"],
+    }
+
+
 def build_workflow():
     if StateGraph is None:
         logger.info("LangGraph is unavailable in this environment; using fallback sequential workflow.")
@@ -1153,4 +1503,8 @@ def run_analyst_workflow(question: str, company_ticker: str | None = None) -> di
         "refresh_attempted": False,
         "execution_log": [],
     }
-    return WORKFLOW.invoke(initial_state)
+    try:
+        return WORKFLOW.invoke(initial_state)
+    except Exception as exc:  # pragma: no cover - exercised through dedicated robustness tests
+        logger.exception("Workflow failed for %s: %s", ticker, exc)
+        return _build_failure_result(question, ticker, str(exc))
