@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - fallback only used when langgraph is u
     StateGraph = None  # type: ignore[assignment]
 
 from agents.llm import OptionalLLM
+from agents.sql_tools import sql_query_tool
 from agents.tools import (
     chart_tool,
     final_answer_builder,
@@ -32,6 +33,7 @@ from schemas.models import (
     AnalysisFinding,
     EDAPlan,
     EvidenceBundle,
+    FinalAnswer,
     OrchestrationPlan,
     ResearchPlan,
     RetrievalPlan,
@@ -44,7 +46,7 @@ from storage.query_service import infer_anchor_dates_from_metrics
 logger = get_logger(__name__)
 
 ALLOWED_SOURCE_TYPES = {"sec_filing", "press_release"}
-ALLOWED_EDA_TOOLS = {"financial_trend_tool", "market_reaction_tool", "text_theme_tool", "chart_tool"}
+ALLOWED_EDA_TOOLS = {"financial_trend_tool", "market_reaction_tool", "text_theme_tool", "chart_tool", "sql_query_tool"}
 
 
 class AgentState(TypedDict, total=False):
@@ -70,6 +72,8 @@ class AgentState(TypedDict, total=False):
     clarification_needed: bool
     clarification_question: str | None
     clarification_reason: str | None
+    out_of_scope: bool
+    out_of_scope_reason: str | None
     execution_log: list[str]
 
 
@@ -198,6 +202,108 @@ def _detect_clarification_need(question: str) -> tuple[bool, str | None, str | N
     return False, None, None
 
 
+def _detect_out_of_scope(question: str, ticker: str) -> tuple[bool, str | None]:
+    lowered = question.lower().strip()
+    if not lowered:
+        return False, None
+
+    analysis_terms = {
+        "revenue",
+        "income",
+        "profit",
+        "eps",
+        "cash",
+        "margin",
+        "quarter",
+        "quarters",
+        "financial",
+        "growth",
+        "stock",
+        "price",
+        "market",
+        "volume",
+        "return",
+        "reaction",
+        "risk",
+        "risks",
+        "filing",
+        "filings",
+        "press",
+        "release",
+        "releases",
+        "source",
+        "sources",
+        "dataset",
+        "records",
+        "count",
+        "breakdown",
+        "distribution",
+        "average",
+        "company",
+        ticker.lower(),
+    }
+    off_domain_terms = {
+        "weather",
+        "temperature",
+        "forecast",
+        "recipe",
+        "cook",
+        "poem",
+        "joke",
+        "story",
+        "translate",
+        "translation",
+        "capital",
+        "president",
+        "movie",
+        "music",
+        "song",
+        "travel",
+        "hotel",
+        "flight",
+        "restaurant",
+        "sports",
+        "nba",
+        "nfl",
+        "soccer",
+        "baseball",
+        "program",
+        "code",
+        "coding",
+        "debug",
+        "bug",
+        "algorithm",
+        "math",
+        "algebra",
+        "calculus",
+    }
+
+    has_analysis_signal = any(term in lowered for term in analysis_terms)
+    matched_off_domain = sorted(term for term in off_domain_terms if term in lowered)
+    if matched_off_domain and not has_analysis_signal:
+        return (
+            True,
+            "This app is scoped to company-analysis questions over filings, financial metrics, market data, press releases, and source metadata."
+        )
+    return False, None
+
+
+def _needs_sql_analysis(question: str) -> bool:
+    lowered = question.lower()
+    sql_patterns = [
+        "how many",
+        "count",
+        "breakdown",
+        "distribution",
+        "average",
+        "avg",
+        "by source",
+        "by source type",
+        "grouped by",
+    ]
+    return any(pattern in lowered for pattern in sql_patterns)
+
+
 def _deep_merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     merged = deepcopy(base)
     for key, value in updates.items():
@@ -232,6 +338,8 @@ def _heuristic_retrieval_plan(question: str, question_category: str, question_ty
 
 def _heuristic_eda_plan(question: str, question_category: str, retrieval_plan: RetrievalPlan) -> EDAPlan:
     selected_tools: list[str] = []
+    if _needs_sql_analysis(question):
+        selected_tools.append("sql_query_tool")
     if question_category in {"financial_trend", "mixed"} and retrieval_plan.needs_quantitative:
         selected_tools.append("financial_trend_tool")
     if question_category in {"market_reaction", "mixed"} and retrieval_plan.needs_market_data:
@@ -268,6 +376,31 @@ def _heuristic_orchestration_plan(question: str, ticker: str) -> OrchestrationPl
             f"Heuristic sub-intents: {', '.join(sub_intents)}",
         ],
         confidence_notes="Deterministic planning fallback is available if LLM planning fails.",
+        planning_source="heuristic",
+    )
+
+
+def _out_of_scope_orchestration_plan(question: str, ticker: str, reason: str | None) -> OrchestrationPlan:
+    return OrchestrationPlan(
+        company_ticker=ticker,
+        question=question,
+        question_type="out_of_scope",
+        question_category="out_of_scope",
+        sub_intents=[],
+        retrieval_plan=RetrievalPlan(
+            needs_qualitative=False,
+            needs_quantitative=False,
+            source_types=[],
+            metric_names=[],
+            limit_per_metric=1,
+            needs_market_data=False,
+            anchor_date_count=1,
+            market_window_days=1,
+        ),
+        eda_plan=EDAPlan(selected_tools=[], chart_metric=None, notes=[]),
+        retry_policy={"allow_retry": False, "max_retries": 0},
+        notes=[reason] if reason else ["Question is outside the current company-analysis scope."],
+        confidence_notes="Out-of-scope guardrail triggered before collection.",
         planning_source="heuristic",
     )
 
@@ -344,7 +477,7 @@ def _llm_orchestration_plan(question: str, ticker: str, fallback: OrchestrationP
         "- question_type must be one of qualitative, quantitative, mixed\n"
         "- sub_intents must be a list containing any of financial_trend, market_reaction, risk_narrative\n"
         "- retrieval_plan.source_types can only include sec_filing and press_release\n"
-        "- eda_plan.selected_tools can only include financial_trend_tool, market_reaction_tool, text_theme_tool, chart_tool\n"
+        "- eda_plan.selected_tools can only include financial_trend_tool, market_reaction_tool, text_theme_tool, chart_tool, sql_query_tool\n"
         "- do not request market data unless the question genuinely needs price or reaction context\n"
         "- do not request both qualitative and quantitative unless both are actually needed\n"
         "- never answer the question; only plan the workflow\n"
@@ -358,6 +491,19 @@ def _llm_orchestration_plan(question: str, ticker: str, fallback: OrchestrationP
 
 
 def _research_plan_from_orchestration(plan: OrchestrationPlan) -> ResearchPlan:
+    if plan.question_category == "out_of_scope":
+        note_text = " ".join(plan.notes).strip() or None
+        return ResearchPlan(
+            company_ticker=plan.company_ticker,
+            question=plan.question,
+            question_type=plan.question_type,
+            question_category=plan.question_category,
+            sub_intents=[],
+            goals=["Do not collect or analyze data because the question is outside the current app scope."],
+            tools_to_call=[],
+            notes=note_text,
+        )
+
     goals: list[str] = []
     tools_to_call = list(plan.eda_plan.selected_tools)
     if plan.retrieval_plan.needs_qualitative:
@@ -387,9 +533,13 @@ def _research_plan_from_orchestration(plan: OrchestrationPlan) -> ResearchPlan:
 def _planner_node(state: AgentState) -> AgentState:
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
+    out_of_scope, out_of_scope_reason = _detect_out_of_scope(question, ticker)
     clarification_needed, clarification_question, clarification_reason = _detect_clarification_need(question)
-    heuristic_plan = _heuristic_orchestration_plan(question, ticker)
-    orchestration_plan = _llm_orchestration_plan(question, ticker, heuristic_plan) or heuristic_plan
+    if out_of_scope:
+        orchestration_plan = _out_of_scope_orchestration_plan(question, ticker, out_of_scope_reason)
+    else:
+        heuristic_plan = _heuristic_orchestration_plan(question, ticker)
+        orchestration_plan = _llm_orchestration_plan(question, ticker, heuristic_plan) or heuristic_plan
     if clarification_needed and clarification_reason:
         orchestration_plan = orchestration_plan.model_copy(
             update={
@@ -420,8 +570,16 @@ def _planner_node(state: AgentState) -> AgentState:
         "clarification_needed": clarification_needed,
         "clarification_question": clarification_question,
         "clarification_reason": clarification_reason,
-        "execution_log": [*state.get("execution_log", []), f"planner:{routing_source}"],
+        "out_of_scope": out_of_scope,
+        "out_of_scope_reason": out_of_scope_reason,
+        "execution_log": [*state.get("execution_log", []), f"planner:{'out_of_scope' if out_of_scope else routing_source}"],
     }
+
+
+def _route_after_planner(state: AgentState) -> str:
+    if state.get("out_of_scope"):
+        return "analyst"
+    return "collector"
 
 
 def _merge_records(existing: list[dict[str, Any]], incoming: list[dict[str, Any]], key_fields: list[str]) -> list[dict[str, Any]]:
@@ -437,6 +595,26 @@ def _merge_records(existing: list[dict[str, Any]], incoming: list[dict[str, Any]
 
 
 def _collector_node(state: AgentState) -> AgentState:
+    if state.get("out_of_scope"):
+        ticker = state.get("company_ticker") or get_settings().default_ticker
+        question = state["question"]
+        evidence_bundle = EvidenceBundle(
+            company_ticker=ticker,
+            question=question,
+            qualitative_records=[],
+            quantitative_records=[],
+            retrieval_notes=[state.get("out_of_scope_reason") or "Out-of-scope guardrail triggered."],
+            tool_results=[],
+        )
+        return {
+            "company_ticker": ticker,
+            "evidence_bundle": evidence_bundle.model_dump(),
+            "requested_sources": [],
+            "selected_sources": [],
+            "selected_tools": [],
+            "execution_log": [*state.get("execution_log", []), "collector:skipped_out_of_scope"],
+        }
+
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
     plan = OrchestrationPlan.model_validate(state["orchestration_plan"])
@@ -648,6 +826,24 @@ def _llm_retry_decision(
 
 
 def _eda_node(state: AgentState) -> AgentState:
+    if state.get("out_of_scope"):
+        ticker = state.get("company_ticker") or get_settings().default_ticker
+        question = state["question"]
+        analysis_bundle = AnalysisBundle(
+            company_ticker=ticker,
+            question=question,
+            findings=[],
+            notes=[state.get("out_of_scope_reason") or "Out-of-scope guardrail triggered before EDA."],
+            requires_additional_research=False,
+            missing_modalities=[],
+        )
+        return {
+            "analysis_bundle": analysis_bundle.model_dump(),
+            "retry_decision": RetryDecision(retry_requested=False).model_dump(),
+            "selected_tools": [],
+            "execution_log": [*state.get("execution_log", []), "eda:skipped_out_of_scope"],
+        }
+
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
     plan = OrchestrationPlan.model_validate(state["orchestration_plan"])
@@ -755,6 +951,31 @@ def _eda_node(state: AgentState) -> AgentState:
             else:
                 notes.append("Skipped chart_tool because no chartable rows were available.")
 
+        if tool_name == "sql_query_tool":
+            sql_allowed_tables = ["financial_metrics", "market_data", "chunks", "sources"]
+            sql_result = sql_query_tool.invoke(
+                {
+                    "ticker": ticker,
+                    "question": question,
+                    "mode": "analysis",
+                    "allowed_tables": sql_allowed_tables,
+                    "max_rows": 20,
+                    "max_retries": 2,
+                }
+            )
+            if sql_result.get("finding"):
+                findings.append(AnalysisFinding.model_validate(sql_result["finding"]))
+            artifact_path = sql_result.get("artifact_path")
+            if artifact_path:
+                notes.append(f"SQL analysis artifact saved to {artifact_path}")
+            sql_status = ((sql_result.get("sql_result") or {}).get("status"))
+            if sql_status == "error":
+                error_message = ((sql_result.get("sql_result") or {}).get("error_message"))
+                if error_message:
+                    notes.append(f"SQL analysis error: {error_message}")
+            execution_log.append("sql_query_tool")
+            selected_tools_executed.append("sql_query_tool")
+
     fallback_retry = _build_retry_decision(
         plan=plan,
         evidence_bundle=evidence_bundle,
@@ -813,6 +1034,49 @@ def _route_after_eda(state: AgentState) -> str:
 def _analyst_node(state: AgentState) -> AgentState:
     question = state["question"]
     ticker = state.get("company_ticker") or get_settings().default_ticker
+    if state.get("out_of_scope"):
+        reason = state.get("out_of_scope_reason") or "This question is outside the current app scope."
+        evidence_bundle = EvidenceBundle(
+            company_ticker=ticker,
+            question=question,
+            qualitative_records=[],
+            quantitative_records=[],
+            retrieval_notes=[reason],
+            tool_results=[],
+        )
+        analysis_bundle = AnalysisBundle(
+            company_ticker=ticker,
+            question=question,
+            findings=[],
+            notes=[reason],
+            requires_additional_research=False,
+            missing_modalities=[],
+        )
+        final_answer = FinalAnswer(
+            company_ticker=ticker,
+            question=question,
+            answer=(
+                "This app is designed for company-analysis questions over filings, financial metrics, market data, "
+                "press releases, and source metadata.\n\n"
+                f"This question is outside the current app scope. {reason} "
+                f"Try asking about {ticker} revenue, market reaction, risks, press releases, or source coverage."
+            ),
+            key_points=[
+                "No collection or EDA ran because the question is outside the current app scope.",
+                f"Best-supported topics include {ticker} financials, market reaction, filings, press releases, and source metadata.",
+            ],
+            sources=[],
+            confidence_note="Out-of-scope guardrail triggered before evidence collection.",
+        )
+        return {
+            "evidence_bundle": evidence_bundle.model_dump(),
+            "analysis_bundle": analysis_bundle.model_dump(),
+            "retry_decision": RetryDecision(retry_requested=False).model_dump(),
+            "final_answer": final_answer.model_dump(),
+            "memo_artifact_path": None,
+            "execution_log": [*state.get("execution_log", []), "analyst:out_of_scope"],
+        }
+
     evidence_bundle = EvidenceBundle.model_validate(state["evidence_bundle"])
     analysis_bundle = AnalysisBundle.model_validate(state["analysis_bundle"])
     orchestration_plan = OrchestrationPlan.model_validate(state["orchestration_plan"])
@@ -849,11 +1113,12 @@ class _FallbackWorkflow:
     def invoke(self, initial_state: AgentState) -> AgentState:
         state = dict(initial_state)
         state.update(_planner_node(state))
-        state.update(_collector_node(state))
-        state.update(_eda_node(state))
-        if _route_after_eda(state) == "collector":
+        if _route_after_planner(state) == "collector":
             state.update(_collector_node(state))
             state.update(_eda_node(state))
+            if _route_after_eda(state) == "collector":
+                state.update(_collector_node(state))
+                state.update(_eda_node(state))
         state.update(_analyst_node(state))
         return state
 
@@ -869,7 +1134,7 @@ def build_workflow():
     graph.add_node("eda", _eda_node)
     graph.add_node("analyst", _analyst_node)
     graph.add_edge(START, "planner")
-    graph.add_edge("planner", "collector")
+    graph.add_conditional_edges("planner", _route_after_planner, {"collector": "collector", "analyst": "analyst"})
     graph.add_edge("collector", "eda")
     graph.add_conditional_edges("eda", _route_after_eda, {"collector": "collector", "analyst": "analyst"})
     graph.add_edge("analyst", END)

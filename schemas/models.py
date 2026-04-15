@@ -9,11 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field
 # These literals keep source/category values consistent across the app.
 # That makes downstream filtering and tool responses much easier to reason about.
 SourceType = Literal["sec_filing", "press_release", "companyfacts", "market_data", "derived"]
-QuestionType = Literal["qualitative", "quantitative", "mixed"]
-QuestionCategory = Literal["financial_trend", "market_reaction", "risk_narrative", "mixed"]
+QuestionType = Literal["qualitative", "quantitative", "mixed", "out_of_scope"]
+QuestionCategory = Literal["financial_trend", "market_reaction", "risk_narrative", "mixed", "out_of_scope"]
 QuestionSubIntent = Literal["financial_trend", "market_reaction", "risk_narrative"]
 PlanningSource = Literal["llm", "heuristic"]
 RoutingSource = Literal["llm", "heuristic_fallback"]
+SQLQueryMode = Literal["single_query", "analysis"]
 
 
 class BaseSchema(BaseModel):
@@ -153,6 +154,56 @@ class OrchestrationPlan(BaseSchema):
     notes: list[str] = Field(default_factory=list)
     confidence_notes: str | None = None
     planning_source: PlanningSource = "heuristic"
+
+
+class SchemaColumnProfile(BaseSchema):
+    table_name: str
+    column_name: str
+    data_type: str
+    description: str | None = None
+    sample_values: list[str] = Field(default_factory=list)
+    is_enum: bool = False
+    enum_values: list[str] = Field(default_factory=list)
+
+
+class SchemaTableProfile(BaseSchema):
+    table_name: str
+    description: str | None = None
+    columns: list[SchemaColumnProfile] = Field(default_factory=list)
+
+
+class SchemaContext(BaseSchema):
+    ticker: str
+    question: str
+    relevant_tables: list[str] = Field(default_factory=list)
+    tables: list[SchemaTableProfile] = Field(default_factory=list)
+    glossary_hits: dict[str, str] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
+class SQLQueryRequest(BaseSchema):
+    question: str
+    ticker: str
+    mode: SQLQueryMode = "single_query"
+    allowed_tables: list[str] = Field(default_factory=list)
+    max_rows: int = Field(default=50, ge=1, le=200)
+
+
+class SQLQueryCandidate(BaseSchema):
+    sql: str
+    reasoning_note: str | None = None
+    tables_used: list[str] = Field(default_factory=list)
+
+
+class SQLQueryResult(BaseSchema):
+    ticker: str
+    question: str
+    sql: str
+    status: Literal["ok", "error"] = "ok"
+    row_count: int = 0
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    error_message: str | None = None
 
 
 class ToolRequest(BaseSchema):

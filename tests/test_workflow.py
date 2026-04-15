@@ -313,6 +313,17 @@ class WorkflowSmokeTests(unittest.TestCase):
         self.assertTrue(result["clarification_needed"])
         self.assertIn("financial performance", result["clarification_question"])
 
+    def test_out_of_scope_question_triggers_guardrail(self) -> None:
+        graph_workflow = importlib.import_module("graph.workflow")
+        result = graph_workflow.run_analyst_workflow(
+            "Write me a poem about tomorrow's weather",
+            company_ticker="NVDA",
+        )
+        self.assertTrue(result["out_of_scope"])
+        self.assertEqual([], result["selected_tools"])
+        self.assertIn("outside the current app scope", result["final_answer"]["answer"])
+        self.assertIn("analyst:out_of_scope", result["execution_log"])
+
     def test_mixed_answer_includes_source_aware_narrative_point(self) -> None:
         graph_workflow = importlib.import_module("graph.workflow")
         result = graph_workflow.run_analyst_workflow(

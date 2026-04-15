@@ -41,6 +41,8 @@ def _render_collect_section(
     clarification_needed: bool,
     clarification_question: str | None,
     clarification_reason: str | None,
+    out_of_scope: bool,
+    out_of_scope_reason: str | None,
 ) -> None:
     # This tab answers "what did the system collect before it started reasoning?"
     # Keeping the collection stage visible is important for the assignment and for debugging:
@@ -48,6 +50,8 @@ def _render_collect_section(
     # missing evidence rather than bad analysis or synthesis.
     st.subheader("Collect")
     st.write("The Collector agent decides which evidence to retrieve before any conclusion is written.")
+    if out_of_scope and out_of_scope_reason:
+        st.warning(out_of_scope_reason)
     if clarification_needed and clarification_question:
         st.warning(f"Clarification could improve this run: {clarification_question}")
         if clarification_reason:
@@ -106,6 +110,108 @@ def _render_chart(chart_spec: dict[str, Any] | None) -> None:
             st.line_chart(line_df.set_index(x_field), height=320)
 
 
+def _humanize_label(value: str) -> str:
+    return value.replace("_", " ").strip().title()
+
+
+def _format_metric_value(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        return f"{value:,.2f}" if abs(value) >= 1000 else f"{value:.2f}"
+    if isinstance(value, list):
+        preview = ", ".join(str(item) for item in value[:3])
+        suffix = " ..." if len(value) > 3 else ""
+        return f"{preview}{suffix}" if preview else "-"
+    return str(value)
+
+
+def _summary_metrics_for_finding(finding_type: str, metrics: dict[str, Any]) -> list[tuple[str, str]]:
+    if finding_type == "financial_trend":
+        return [
+            ("Metric", _humanize_label(str(metrics.get("metric_name") or ""))),
+            ("Latest Period", _format_metric_value(metrics.get("latest_fiscal_period"))),
+            ("Latest Value", _format_metric_value(metrics.get("latest_value"))),
+            ("Previous Period", _format_metric_value(metrics.get("previous_fiscal_period"))),
+            ("Previous Value", _format_metric_value(metrics.get("previous_value"))),
+            ("Change", f"{float(metrics['pct_change']):+.1f}%" if metrics.get("pct_change") is not None else "-"),
+        ]
+    if finding_type == "market_reaction":
+        anchor_dates = metrics.get("anchor_dates") or []
+        anchor_label = str(anchor_dates[0])[:10] if anchor_dates else "-"
+        return [
+            ("Anchor Date", anchor_label),
+            ("Start Close", _format_metric_value(metrics.get("window_start_close"))),
+            ("End Close", _format_metric_value(metrics.get("window_end_close"))),
+            ("Total Return", f"{float(metrics['total_return_pct']):+.1f}%" if metrics.get("total_return_pct") is not None else "-"),
+            ("Volatility", _format_metric_value(metrics.get("daily_return_stddev"))),
+        ]
+    if finding_type == "text_theme":
+        top_themes = metrics.get("top_themes") or []
+        source_counts = metrics.get("source_counts") or []
+        theme_text = ", ".join(f"{_humanize_label(str(name))} ({count})" for name, count in top_themes[:3]) or "-"
+        source_text = ", ".join(f"{_humanize_label(str(name))} ({count})" for name, count in source_counts[:3]) or "-"
+        return [
+            ("Dominant Section", _humanize_label(str(metrics.get("dominant_section") or ""))),
+            ("Section Count", _format_metric_value(metrics.get("dominant_section_count"))),
+            ("Top Themes", theme_text),
+            ("Sources", source_text),
+        ]
+    if finding_type == "sql_analysis":
+        tables_used = metrics.get("tables_used") or []
+        return [
+            ("Status", _format_metric_value(metrics.get("status"))),
+            ("Rows Returned", _format_metric_value(metrics.get("row_count"))),
+            ("Tables Used", ", ".join(str(table) for table in tables_used) or "-"),
+        ]
+
+    return [(_humanize_label(str(key)), _format_metric_value(value)) for key, value in metrics.items()]
+
+
+def _compact_supporting_records(records: list[dict[str, Any]]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame()
+
+    preferred_columns = [
+        "fiscal_period",
+        "metric_name",
+        "metric_value",
+        "unit",
+        "date",
+        "close",
+        "volume",
+        "title",
+        "source_type",
+        "evidence_excerpt",
+        "as_of_date",
+    ]
+    hidden_columns = {"id", "company_ticker", "source_id", "metadata_json", "embedding_id", "source_url", "published_at"}
+
+    rows: list[dict[str, Any]] = []
+    for record in records[:5]:
+        compact_row: dict[str, Any] = {}
+        for key, value in record.items():
+            if key in hidden_columns or value in (None, "", [], {}):
+                continue
+            if key == "chunk_text":
+                compact_row["evidence_excerpt"] = str(value)[:220] + ("..." if len(str(value)) > 220 else "")
+            else:
+                compact_row[key] = value
+        rows.append(compact_row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    ordered_columns = [column for column in preferred_columns if column in df.columns]
+    remaining_columns = [column for column in df.columns if column not in ordered_columns]
+    return df[ordered_columns + remaining_columns]
+
+
 def _render_explore_section(
     analysis_bundle: AnalysisBundle,
     retry_decision: RetryDecision,
@@ -119,12 +225,25 @@ def _render_explore_section(
     st.write("The EDA agent uses tool calls over the retrieved data before the analyst hypothesis is formed.")
     for finding in analysis_bundle.findings:
         with st.container(border=True):
-            st.markdown(f"**{finding.finding_type.replace('_', ' ').title()}**")
+            title = finding.finding_type.replace("_", " ").title()
+            st.markdown(f"**{title}**")
             st.write(finding.summary)
             if finding.metrics:
-                st.json(finding.metrics)
+                summary_metrics = _summary_metrics_for_finding(finding.finding_type, finding.metrics)
+                if summary_metrics:
+                    metric_df = pd.DataFrame(summary_metrics, columns=["Metric", "Value"])
+                    st.dataframe(metric_df, use_container_width=True, hide_index=True)
             if finding.supporting_records:
-                st.dataframe(pd.DataFrame(finding.supporting_records[:5]), use_container_width=True)
+                evidence_df = _compact_supporting_records(finding.supporting_records)
+                if not evidence_df.empty:
+                    with st.expander(f"Show evidence for {title.lower()}"):
+                        st.dataframe(evidence_df, use_container_width=True, hide_index=True)
+            if finding.metrics or finding.supporting_records:
+                with st.expander("Raw EDA payload"):
+                    if finding.metrics:
+                        st.json(finding.metrics)
+                    if finding.supporting_records:
+                        st.dataframe(pd.DataFrame(finding.supporting_records[:5]), use_container_width=True)
 
     if analysis_bundle.notes:
         st.markdown("**EDA notes**")
@@ -148,12 +267,19 @@ def _render_explore_section(
         st.caption(f"Chart spec artifact: `{chart_artifact_path}`")
 
 
-def _render_hypothesis_section(final_answer: FinalAnswer, memo_artifact_path: str | None) -> None:
+def _render_hypothesis_section(
+    final_answer: FinalAnswer,
+    memo_artifact_path: str | None,
+    out_of_scope: bool,
+) -> None:
     # This is the final analyst deliverable. By the time we render this tab, the workflow
     # has already completed collection and EDA, so this section should read like a synthesis
     # of earlier evidence rather than a brand-new source of facts.
     st.subheader("Hypothesis")
-    st.write("The Analyst agent synthesizes the evidence and EDA findings into a grounded answer.")
+    if out_of_scope:
+        st.write("The system stopped before collection because the question was outside the current company-analysis scope.")
+    else:
+        st.write("The Analyst agent synthesizes the evidence and EDA findings into a grounded answer.")
     st.markdown(final_answer.answer)
     if final_answer.key_points:
         st.markdown("**Key points**")
@@ -243,6 +369,8 @@ def main() -> None:
             bool(result.get("clarification_needed")),
             result.get("clarification_question"),
             result.get("clarification_reason"),
+            bool(result.get("out_of_scope")),
+            result.get("out_of_scope_reason"),
         )
 
     with explore_tab:
@@ -254,7 +382,7 @@ def main() -> None:
         )
 
     with hypothesis_tab:
-        _render_hypothesis_section(final_answer, result.get("memo_artifact_path"))
+        _render_hypothesis_section(final_answer, result.get("memo_artifact_path"), bool(result.get("out_of_scope")))
 
     with debug_tab:
         st.markdown("**Execution log**")

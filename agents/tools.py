@@ -712,6 +712,14 @@ def final_answer_builder(
         source_url = record.get("source_url")
         if source_url and source_url not in sources:
             sources.append(str(source_url))
+    for finding in ranked_findings[:3]:
+        for record in finding.get("supporting_records", [])[:5]:
+            source_url = record.get("source_url")
+            title = record.get("title")
+            if source_url and source_url not in sources:
+                sources.append(str(source_url))
+            if title and len(support_snippets) < 3:
+                support_snippets.append(f"- {title}")
 
     text_finding = next((finding for finding in ranked_findings if finding.get("finding_type") == "text_theme"), None)
     lowered_question = question.lower()

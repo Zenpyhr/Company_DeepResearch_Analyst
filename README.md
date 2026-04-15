@@ -1,80 +1,313 @@
 # Project 2: Company Data Analyst Agent
 
-Company data analyst agent with explicit `Collect -> Explore / Analyze -> Hypothesize` stages.
+Company analyst agent with an explicit `Collect -> Explore -> Hypothesize` workflow, a Streamlit frontend, a LangGraph backend, deterministic analysis tools, and a new safe Text2SQL path for structured metadata questions.
 
 ## Live App
 
 - Public URL:
   - `https://company-deepresearch-analyst-git-555207000332.us-central1.run.app`
 
-## What This App Does
+## Agent Capabilities
 
-- Collects real external company data at runtime from:
+- Answers company-analysis questions about:
+  - financial trends
+  - market reaction
+  - filing / press-release risk and growth themes
+  - source-coverage and metadata questions through Text2SQL
+- Retrieves real company data from:
   - SEC filings
   - SEC CompanyFacts
-  - Yahoo Finance market data
+  - Yahoo Finance market history
   - NVIDIA press releases
-- Runs a LangGraph multi-agent workflow:
-  - `Collector Agent`
+- Uses a LangGraph workflow to:
+  - plan the analysis path
+  - collect evidence
+  - run tool-based EDA
+  - produce a grounded final answer with sources
+- Includes an out-of-scope guardrail for unrelated requests such as weather, recipes, creative writing, sports, and general coding tasks
+- Generates artifacts such as:
+  - CSVs
+  - chart specs
+  - markdown memos
+  - SQL result artifacts
+
+## System Structure
+
+- `Frontend`
+  - [streamlit_app.py](./streamlit_app.py)
+- `Backend workflow / orchestrator`
+  - [graph/workflow.py](./graph/workflow.py)
+- `Tools`
+  - [agents/tools.py](./agents/tools.py)
+  - [agents/sql_tools.py](./agents/sql_tools.py)
+- `Storage + SQL helpers`
+  - [storage/query_service.py](./storage/query_service.py)
+  - [storage/schema_catalog.py](./storage/schema_catalog.py)
+  - [storage/sql_validator.py](./storage/sql_validator.py)
+  - [storage/sql_executor.py](./storage/sql_executor.py)
+- `Collection pipelines`
+  - [pipelines/](./pipelines)
+
+The frontend calls `run_analyst_workflow()`, the workflow decides which tools to use, and those tools call lower-level retrieval, SQL, and artifact helpers.
+
+## Rubric Mapping
+
+### Step 1: Collect
+
+The app collects real, non-trivial company data and retrieves question-relevant evidence before the final answer is written.
+
+- `Runtime external data collection`
+  - [pipelines/refresh_company.py](./pipelines/refresh_company.py) `refresh_company_data`
+  - [agents/tools.py](./agents/tools.py) `refresh_company_data_tool`
+- `SEC filings`
+  - [pipelines/sec_client.py](./pipelines/sec_client.py) `fetch_recent_filings`
+- `SEC CompanyFacts`
+  - [pipelines/companyfacts_client.py](./pipelines/companyfacts_client.py) `fetch_companyfacts`
+- `Yahoo Finance market data`
+  - [pipelines/market_data.py](./pipelines/market_data.py) `fetch_market_history`
+- `NVIDIA press releases`
+  - [pipelines/press_releases.py](./pipelines/press_releases.py) `fetch_press_releases`
+- `Chunking for qualitative retrieval`
+  - [pipelines/text_processing.py](./pipelines/text_processing.py) `process_company_documents`
+- `Question-driven retrieval from local structured storage`
+  - [agents/tools.py](./agents/tools.py) `retrieve_document_context_tool`
+  - [agents/tools.py](./agents/tools.py) `retrieve_financial_metrics_tool`
+  - [agents/tools.py](./agents/tools.py) `retrieve_market_data_tool`
+  - [storage/query_service.py](./storage/query_service.py) `search_document_chunks`
+  - [storage/query_service.py](./storage/query_service.py) `fetch_financial_metrics`
+  - [storage/query_service.py](./storage/query_service.py) `fetch_market_data`
+
+How collection is dynamic:
+
+- The planner classifies the question and chooses the evidence path in [graph/workflow.py](./graph/workflow.py) `_planner_node`, `_heuristic_orchestration_plan`, and `_research_plan_from_orchestration`.
+- Different questions trigger different retrieval combinations:
+  - financial questions -> financial metrics
+  - market questions -> market data windows
+  - filing / press-release questions -> chunk retrieval
+  - metadata / breakdown questions -> SQL path
+- If no evidence is available locally, the collector attempts a refresh once inside [graph/workflow.py](./graph/workflow.py) `_collector_node`.
+
+Notes:
+
+- The strongest supported end-to-end path is still `NVDA`.
+- Refresh is available from the UI and also as an empty-evidence fallback.
+- The current system does not yet auto-refresh based on staleness; it refreshes on explicit user request or when the local evidence bundle is empty.
+
+### Step 2: Explore
+
+The app performs EDA with tool calls over collected data before writing the final answer.
+
+- `EDA workflow node`
+  - [graph/workflow.py](./graph/workflow.py) `_eda_node`
+- `Financial EDA`
+  - [agents/tools.py](./agents/tools.py) `financial_trend_tool`
+- `Market EDA`
+  - [agents/tools.py](./agents/tools.py) `market_reaction_tool`
+- `Qualitative text-theme EDA`
+  - [agents/tools.py](./agents/tools.py) `text_theme_tool`
+- `Visualization`
+  - [agents/tools.py](./agents/tools.py) `chart_tool`
+- `Text2SQL EDA for structured metadata / grouped questions`
+  - [agents/sql_tools.py](./agents/sql_tools.py) `schema_context_tool`
+  - [agents/sql_tools.py](./agents/sql_tools.py) `sql_query_tool`
+  - [storage/schema_catalog.py](./storage/schema_catalog.py) `build_schema_context`
+  - [storage/sql_validator.py](./storage/sql_validator.py) `validate_select_sql`
+  - [storage/sql_executor.py](./storage/sql_executor.py) `execute_readonly_sql`
+
+Examples of EDA behavior:
+
+- `financial_trend_tool` computes period-over-period changes and returns concrete findings.
+- `market_reaction_tool` computes total return and volatility over the retrieved market window.
+- `text_theme_tool` counts repeated themes and source-specific patterns in filings and press releases.
+- `sql_query_tool` generates safe read-only SQL for count / breakdown / distribution / average style questions and returns rows as a finding.
+
+The Explore tab in [streamlit_app.py](./streamlit_app.py) shows the EDA findings first and keeps raw payloads behind expanders so the analysis remains auditable without overwhelming the UI.
+
+### Step 3: Hypothesize
+
+The final answer is built from collected evidence and EDA findings, not directly from the question alone.
+
+- `Analyst workflow node`
+  - [graph/workflow.py](./graph/workflow.py) `_analyst_node`
+- `Final synthesis`
+  - [agents/tools.py](./agents/tools.py) `final_answer_builder`
+
+How the hypothesis is grounded:
+
+- The analyst node passes the evidence bundle and analysis bundle into `final_answer_builder`.
+- `final_answer_builder` ranks findings, selects key points, gathers source URLs, and writes the final memo artifact.
+- The frontend displays:
+  - answer
+  - key points
+  - sources
+  - confidence note
+
+## Core Requirements
+
+### Frontend
+
+- Implemented in [streamlit_app.py](./streamlit_app.py)
+- Streamlit UI exposes:
+  - ticker selection
+  - manual refresh
+  - question input
+  - explicit `Collect`, `Explore / Analyze`, `Hypothesis`, and `Debug` tabs
+
+### Agent Framework
+
+- Implemented with LangGraph in [graph/workflow.py](./graph/workflow.py)
+- Nodes:
+  - planner
+  - collector
+  - eda
+  - analyst
+
+### Tool Calling
+
+- Tools live in:
+  - [agents/tools.py](./agents/tools.py)
+  - [agents/sql_tools.py](./agents/sql_tools.py)
+- Workflow nodes invoke tools directly in [graph/workflow.py](./graph/workflow.py)
+
+### Non-Trivial Dataset
+
+- External sources:
+  - SEC filings
+  - SEC CompanyFacts
+  - Yahoo Finance market history
+  - NVIDIA press releases
+- Local structured storage:
+  - SQLite tables for `sources`, `chunks`, `financial_metrics`, `market_data`
+- These datasets are large enough that they are not meant to be fully dumped into prompt context.
+
+### Multi-Agent Pattern
+
+- Orchestrated specialist-agent pattern in [graph/workflow.py](./graph/workflow.py)
+- Responsibilities are separated across:
+  - `Orchestrator / Planner`
+  - `Collector`
   - `EDA Agent`
   - `Analyst Agent`
-- Uses two retrieval methods:
-  - qualitative retrieval over filing / press-release chunks
-  - quantitative retrieval over structured financial and market rows
-- Produces grounded analyst-style answers with explicit evidence, EDA findings, and visualizations
+- Distinct prompts live in [prompts/agent_prompts.py](./prompts/agent_prompts.py)
+- SQL generation also uses specialist prompts in [prompts/sql_prompts.py](./prompts/sql_prompts.py)
 
-## High-Level Architecture
+### Deployed
 
-```mermaid
-flowchart TD
-    U[User]
-    UI[Streamlit Frontend]
-    O[LangGraph Orchestrator]
-    C[Collector Agent]
-    E[EDA Agent]
-    A[Analyst Agent]
-    OUT[Grounded Answer<br/>Citations<br/>Chart / Memo]
+- Public Cloud Run app:
+  - `https://company-deepresearch-analyst-git-555207000332.us-central1.run.app`
+- Deployment files:
+  - [Dockerfile](./Dockerfile)
+  - [cloudbuild.yaml](./cloudbuild.yaml)
+  - [storage/cloud.py](./storage/cloud.py)
 
-    Q[User Question]
-    EB[Evidence Bundle<br/>qualitative records + quantitative records]
-    AF[Analysis Findings<br/>trends + themes + market reaction]
+### README
 
-    U --> UI
-    UI --> Q
-    Q --> O
-    O --> C
-    C --> EB
-    EB --> E
-    E --> AF
-    AF --> A
-    A --> OUT
-    OUT --> UI
-    E -. if evidence is weak, ask for more evidence .-> C
+- This file documents:
+  - the three-step workflow
+  - the core requirements
+  - the grab-bag features
+  - the current scope and fallback behavior
 
-    C --> RL[Retrieval Layer]
-    RL --> QR[Qualitative Retrieval<br/>SEC chunks + press-release chunks]
-    RL --> QN[Quantitative Retrieval<br/>financial metrics + market data]
+## Grab Bag Implemented
 
-    S[Runtime Data Sources<br/>SEC Filings<br/>SEC CompanyFacts<br/>Yahoo Finance<br/>NVIDIA Press Releases] --> RL
-    D[(Data Storage<br/>SQLite local / Cloud SQL hosted)] --> RL
-    F[(Artifacts / Raw Files<br/>local disk / Cloud Storage)] --> OUT
-    L[LLM Backend<br/>OpenAI local / Vertex AI production] --> C
-    L --> E
-    L --> A
-```
+The project implements more than two elective concepts.
 
-At a high level, the `Collector Agent` gathers evidence through the retrieval layer, packages it into an `Evidence Bundle`, the `EDA Agent` turns that into `Analysis Findings`, and the `Analyst Agent` uses both as input for the final grounded answer shown in the frontend.
+### Second Data Retrieval Method
+
+- `Qualitative retrieval`
+  - [storage/query_service.py](./storage/query_service.py) `search_document_chunks`
+- `Quantitative retrieval`
+  - [storage/query_service.py](./storage/query_service.py) `fetch_financial_metrics`
+  - [storage/query_service.py](./storage/query_service.py) `fetch_market_data`
+- `Structured SQL retrieval / analysis`
+  - [agents/sql_tools.py](./agents/sql_tools.py) `sql_query_tool`
+
+### Code Execution
+
+- Pandas-based deterministic analysis in:
+  - [agents/tools.py](./agents/tools.py) `financial_trend_tool`
+  - [agents/tools.py](./agents/tools.py) `market_reaction_tool`
+  - [agents/tools.py](./agents/tools.py) `text_theme_tool`
+
+### Artifacts
+
+- Artifact writing in [app/artifacts.py](./app/artifacts.py)
+- Outputs include:
+  - financial trend CSVs
+  - market reaction CSVs
+  - text-theme CSVs
+  - chart spec JSON
+  - SQL result JSON
+  - final analyst memo markdown
+
+### Structured Output
+
+- Typed schemas in [schemas/models.py](./schemas/models.py)
+- Structured workflow bundles:
+  - `ResearchPlan`
+  - `OrchestrationPlan`
+  - `EvidenceBundle`
+  - `AnalysisBundle`
+  - `FinalAnswer`
+  - `SchemaContext`
+  - `SQLQueryResult`
+
+### Data Visualization
+
+- Vega-Lite chart generation in [agents/tools.py](./agents/tools.py) `chart_tool`
+- Chart rendering in [streamlit_app.py](./streamlit_app.py)
+
+### Iterative Refinement Loop
+
+- Retry path in [graph/workflow.py](./graph/workflow.py)
+- If the EDA phase decides evidence is incomplete, the workflow can route back from EDA to Collector once before final synthesis.
+
+## Scope and Fallback Behavior
+
+### Best-Supported Questions
+
+- Financial trend questions
+- Market reaction questions
+- Filing / press-release growth and risk questions
+- Source-count / metadata / breakdown questions through Text2SQL
+
+### Current Fallbacks
+
+- `Planner fallback`
+  - If LLM planning fails, the workflow uses heuristic planning in [graph/workflow.py](./graph/workflow.py)
+- `LLM answer fallback`
+  - If the LLM is unavailable, the app falls back to deterministic planning and answer construction through [agents/llm.py](./agents/llm.py) and [agents/tools.py](./agents/tools.py) `final_answer_builder`
+- `Refresh fallback`
+  - If retrieval returns no evidence, the collector tries `refresh_company_data_tool` once
+- `SQL fallback`
+  - If LLM SQL generation is unavailable, `sql_query_tool` falls back to a heuristic SQL path
+
+### Out-of-Scope Handling
+
+The current system **does** have an out-of-scope guardrail.
+
+What it does today:
+
+- The planner checks for clearly unrelated requests in [graph/workflow.py](./graph/workflow.py) `_detect_out_of_scope`.
+- If the question is outside the company-analysis domain, the workflow short-circuits before collection and EDA.
+- The final answer explains the supported scope and suggests better in-domain question types.
+- For broad but still in-domain questions, the planner can surface a clarification suggestion in [graph/workflow.py](./graph/workflow.py) `_detect_clarification_need`.
+
+What it does **not** yet do:
+
+- automatic staleness-based refresh
+- fine-grained partial support classification for borderline requests
 
 ## Run Locally
 
-1. Create a virtual environment and activate it.
+1. Create and activate a virtual environment.
 2. Install the project:
 
    ```bash
    pip install -e .
    ```
 
-3. Create a `.env` file. Minimum useful settings:
+3. Create a `.env` file with at least:
 
    ```bash
    OPENAI_API_KEY=...
@@ -82,173 +315,21 @@ At a high level, the `Collector Agent` gathers evidence through the retrieval la
    DEFAULT_TICKER=NVDA
    ```
 
-4. Launch the Streamlit app:
+4. Launch the app:
 
    ```bash
    streamlit run streamlit_app.py
    ```
 
-The app can work with deterministic routing and analysis even if the LLM is unavailable, but the final narrative is better with a configured model.
+## Tests
 
-## Core Workflow
+- Main workflow tests:
+  - [tests/test_workflow.py](./tests/test_workflow.py)
+- Text2SQL tests:
+  - [tests/test_sql_tools.py](./tests/test_sql_tools.py)
 
-The graph above is the system-level view. The stage-by-stage workflow below maps the homework requirements directly to the code.
+Example:
 
-### Collect
-
-The `Collector Agent` gathers the evidence needed for the question before any conclusion is written.
-
-- Refresh + collection:
-  - [pipelines/refresh_company.py](./pipelines/refresh_company.py) `refresh_company_data`
-  - [agents/tools.py](./agents/tools.py) `refresh_company_data_tool`
-- SEC filings:
-  - [pipelines/sec_client.py](./pipelines/sec_client.py) `fetch_recent_filings`
-- CompanyFacts:
-  - [pipelines/companyfacts_client.py](./pipelines/companyfacts_client.py) `fetch_companyfacts`
-- Market data:
-  - [pipelines/market_data.py](./pipelines/market_data.py) `fetch_market_history`
-- Press releases:
-  - [pipelines/press_releases.py](./pipelines/press_releases.py) `fetch_press_releases`
-- Document processing into chunks:
-  - [pipelines/text_processing.py](./pipelines/text_processing.py) `process_company_documents`
-
-### Explore / Analyze
-
-The `EDA Agent` must call tools over retrieved data before the final answer is formed.
-
-- Workflow:
-  - [graph/workflow.py](./graph/workflow.py) `_eda_node`
-- Retrieval tools:
-  - [agents/tools.py](./agents/tools.py) `retrieve_document_context_tool`
-  - [agents/tools.py](./agents/tools.py) `retrieve_financial_metrics_tool`
-  - [agents/tools.py](./agents/tools.py) `retrieve_market_data_tool`
-- EDA tools:
-  - [agents/tools.py](./agents/tools.py) `financial_trend_tool`
-  - [agents/tools.py](./agents/tools.py) `market_reaction_tool`
-  - [agents/tools.py](./agents/tools.py) `text_theme_tool`
-  - [agents/tools.py](./agents/tools.py) `chart_tool`
-
-### Hypothesize
-
-The `Analyst Agent` synthesizes the evidence and EDA findings into a grounded answer with citations.
-
-- Workflow:
-  - [graph/workflow.py](./graph/workflow.py) `_analyst_node`
-- Final answer construction:
-  - [agents/tools.py](./agents/tools.py) `final_answer_builder`
-
-## Homework Requirement Mapping
-
-### Required
-
-- `Frontend`
-  - [streamlit_app.py](./streamlit_app.py)
-- `Agent framework`
-  - [graph/workflow.py](./graph/workflow.py) uses LangGraph
-- `Tool calling`
-  - [agents/tools.py](./agents/tools.py)
-  - tools are invoked inside [graph/workflow.py](./graph/workflow.py)
-- `Non-trivial dataset`
-  - runtime SEC, CompanyFacts, market data, and press-release collection in [pipelines/](./pipelines)
-- `Multi-agent pattern`
-  - `Collector -> EDA -> Analyst` in [graph/workflow.py](./graph/workflow.py)
-- `Deployed`
-  - live Cloud Run app:
-    - `https://project2-company-data-analyst-agent-555207000332.us-central1.run.app`
-  - deployment files:
-    - [Dockerfile](./Dockerfile)
-    - [cloudbuild.yaml](./cloudbuild.yaml)
-- `README`
-  - this file
-
-### Electives Implemented
-
-- `Second data retrieval method`
-  - qualitative chunk retrieval in [storage/query_service.py](./storage/query_service.py) `search_document_chunks`
-  - quantitative structured retrieval in [storage/query_service.py](./storage/query_service.py) `fetch_financial_metrics` and `fetch_market_data`
-- `Code execution`
-  - pandas-driven EDA in [agents/tools.py](./agents/tools.py) `financial_trend_tool` and `market_reaction_tool`
-- `Data visualization`
-  - chart generation in [agents/tools.py](./agents/tools.py) `chart_tool`
-  - chart rendering in [streamlit_app.py](./streamlit_app.py)
-- `Artifacts`
-  - artifact writing in [app/artifacts.py](./app/artifacts.py)
-
-## Retrieval Design
-
-### Qualitative retrieval
-
-Used for narrative or risk questions.
-
-- Data:
-  - SEC filing chunks
-  - press-release chunks
-- Storage:
-  - SQLite `chunks`
-- Retrieval:
-  - [storage/query_service.py](./storage/query_service.py) `search_document_chunks`
-
-### Quantitative retrieval
-
-Used for financial and market questions.
-
-- Data:
-  - CompanyFacts-derived financial metric rows
-  - market data rows
-- Storage:
-  - SQLite `financial_metrics`
-  - SQLite `market_data`
-- Retrieval:
-  - [storage/query_service.py](./storage/query_service.py) `fetch_financial_metrics`
-  - [storage/query_service.py](./storage/query_service.py) `fetch_market_data`
-
-## Key Files
-
-- Streamlit app:
-  - [streamlit_app.py](./streamlit_app.py)
-- LangGraph workflow:
-  - [graph/workflow.py](./graph/workflow.py)
-- Tool layer:
-  - [agents/tools.py](./agents/tools.py)
-- Optional LLM helper:
-  - [agents/llm.py](./agents/llm.py)
-- Agent prompts:
-  - [prompts/agent_prompts.py](./prompts/agent_prompts.py)
-- Query helpers:
-  - [storage/query_service.py](./storage/query_service.py)
-- Artifact handling:
-  - [app/artifacts.py](./app/artifacts.py)
-
-## Cloud Deployment
-
-The hosted target is Google Cloud.
-
-### Planned production stack
-
-- App + Streamlit frontend: Cloud Run
-- Model provider: Vertex AI Gemini
-- Secrets: Secret Manager
-- Raw docs and artifacts: Cloud Storage
-- Structured data: Cloud SQL
-- CI/CD: GitHub -> Cloud Build -> Cloud Run
-
-### Files added for deployment
-
-- [Dockerfile](./Dockerfile)
-- [cloudbuild.yaml](./cloudbuild.yaml)
-- [storage/cloud.py](./storage/cloud.py)
-
-### Typical deployment path
-
-1. Build and verify locally.
-2. Containerize the app with Docker.
-3. Deploy the container to Cloud Run.
-4. Configure env vars / secrets / service account.
-5. Move artifacts to Cloud Storage and structured data to Cloud SQL for production persistence.
-
-## Notes
-
-- The strongest fully supported path is still `NVDA`.
-- New tickers can now be refreshed through SEC filings, SEC CompanyFacts, and market data.
-- Press-release collection is currently company-specific and strongest for `NVDA`.
-- Event extraction is intentionally deferred until the core analyst loop is stable.
+```bash
+.venv\Scripts\python.exe -m unittest tests.test_workflow tests.test_sql_tools
+```
